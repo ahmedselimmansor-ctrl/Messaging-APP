@@ -1,0 +1,13 @@
+# The build context is the repository root because the services share a Go
+# module, so everything not needed for a build is excluded here — a smaller
+# context is a faster build and a smaller attack surface in the builder.
+.git/
+.github/
+local/
+deploy/terraform/.terraform/
+docs/
+web/node_modules/
+*.md
+coverage.out
+.idea/
+.vscode/

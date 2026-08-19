@@ -1,0 +1,7 @@
+# Production replica counts. These are floors; the HPAs take it from here.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: not-used
+spec:
+  replicas: 2

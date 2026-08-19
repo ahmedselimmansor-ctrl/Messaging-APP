@@ -1,0 +1,289 @@
+# Anthos Service Mesh configuration.
+#
+# Three jobs here, in order of how much they matter:
+#
+#  1. STRICT mTLS, so every in-cluster call is authenticated and encrypted.
+#     This is what makes the chat service's trust of the gateway's X-User-Id
+#     header defensible: only the gateway's workload identity can reach
+#     /internal, and the mesh proves that identity cryptographically.
+#  2. AuthorizationPolicy, which enforces exactly that restriction.
+#  3. Traffic splitting for canary deploys.
+
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: messaging
+spec:
+  mtls:
+    # STRICT, not PERMISSIVE. Permissive accepts plaintext, which means the
+    # policy below can be bypassed by anything that can reach the pod IP —
+    # and it silently stays permissive forever because nothing ever fails.
+    mode: STRICT
+---
+# The gateway's raw MTProto ports carry their own encryption and are not
+# mesh traffic, so mTLS must be disabled on 4443 specifically. Without this
+# exception Envoy would reject every MTProto connection as unauthenticated.
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: realtime-gateway
+  namespace: messaging
+spec:
+  selector:
+    matchLabels:
+      app: realtime-gateway
+  mtls:
+    mode: STRICT
+  portLevelMtls:
+    "4443":
+      mode: DISABLE
+---
+# The single most important authorization rule in the platform.
+#
+# chat-service's /internal endpoints trust the X-User-Id header — they perform
+# no token verification, because the gateway already did. That is only safe
+# while nothing but the gateway can reach those paths. This policy is what
+# makes it true.
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: chat-service-internal
+  namespace: messaging
+spec:
+  selector:
+    matchLabels:
+      app: chat-service
+  action: ALLOW
+  rules:
+    # /internal: gateway only.
+    - from:
+        - source:
+            principals:
+              - "cluster.local/ns/messaging/sa/realtime-gateway"
+      to:
+        - operation:
+            paths: ["/internal/*"]
+    # /v1: any authenticated workload in the namespace. The handlers there
+    # verify a JWT themselves, so the mesh only needs to keep out traffic
+    # from outside the mesh entirely.
+    - to:
+        - operation:
+            paths: ["/v1/*"]
+    # Probes and metrics.
+    - to:
+        - operation:
+            ports: ["9090"]
+---
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: auth-service-internal
+  namespace: messaging
+spec:
+  selector:
+    matchLabels:
+      app: auth-service
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals:
+              - "cluster.local/ns/messaging/sa/realtime-gateway"
+      to:
+        - operation:
+            paths: ["/internal/*"]
+    - to:
+        - operation:
+            paths: ["/v1/*", "/.well-known/*"]
+    - to:
+        - operation:
+            ports: ["9090"]
+---
+# Presence is internal-only. Exposing it publicly would let anyone poll
+# whether a given user is online without being their contact.
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: presence-service-internal
+  namespace: messaging
+spec:
+  selector:
+    matchLabels:
+      app: presence-service
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals:
+              - "cluster.local/ns/messaging/sa/realtime-gateway"
+              - "cluster.local/ns/messaging/sa/chat-service"
+              - "cluster.local/ns/messaging/sa/pusher"
+      to:
+        - operation:
+            paths: ["/internal/*"]
+    - to:
+        - operation:
+            ports: ["9090"]
+---
+# Retries and circuit breaking for calls into the chat service.
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: chat-service
+  namespace: messaging
+spec:
+  host: chat-service.messaging.svc.cluster.local
+  trafficPolicy:
+    connectionPool:
+      tcp:
+        maxConnections: 512
+        connectTimeout: 3s
+        tcpKeepalive:
+          time: 30s
+          interval: 10s
+      http:
+        http2MaxRequests: 2048
+        maxRequestsPerConnection: 0
+        # Bound the queue. Without this, a slow backend accumulates pending
+        # requests until the caller runs out of memory — the classic cascading
+        # failure. Rejecting immediately is better feedback than queueing.
+        http1MaxPendingRequests: 256
+        maxRetries: 3
+    outlierDetection:
+      consecutive5xxErrors: 5
+      interval: 10s
+      baseEjectionTime: 30s
+      maxEjectionPercent: 50
+      # Never eject the last healthy endpoint: at 50% max ejection, a service
+      # that is globally unhealthy still gets traffic rather than becoming a
+      # total outage.
+      minHealthPercent: 50
+  # Named subsets for canary traffic splitting.
+  subsets:
+    - name: stable
+      labels:
+        version: stable
+    - name: canary
+      labels:
+        version: canary
+---
+# Canary routing. Cloud Deploy rewrites the weights as a rollout progresses:
+# 10% → 25% → 50% → 100%.
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: chat-service
+  namespace: messaging
+spec:
+  hosts:
+    - chat-service.messaging.svc.cluster.local
+  http:
+    # A client may pin itself to the canary with a header, which is how the
+    # deploy is smoke-tested before any real traffic reaches it.
+    - match:
+        - headers:
+            x-canary:
+              exact: "true"
+      route:
+        - destination:
+            host: chat-service.messaging.svc.cluster.local
+            subset: canary
+    - route:
+        - destination:
+            host: chat-service.messaging.svc.cluster.local
+            subset: stable
+          weight: 100
+        - destination:
+            host: chat-service.messaging.svc.cluster.local
+            subset: canary
+          weight: 0
+      retries:
+        attempts: 3
+        perTryTimeout: 3s
+        # Retry only what is safe to retry. Retrying a 5xx from a send would
+        # risk a duplicate message — the random_id dedupe covers it, but
+        # relying on that for every retry is worse than not retrying.
+        retryOn: connect-failure,refused-stream,unavailable
+      timeout: 15s
+---
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: auth-service
+  namespace: messaging
+spec:
+  host: auth-service.messaging.svc.cluster.local
+  trafficPolicy:
+    connectionPool:
+      tcp:
+        maxConnections: 256
+        connectTimeout: 3s
+      http:
+        http2MaxRequests: 512
+        http1MaxPendingRequests: 128
+    outlierDetection:
+      consecutive5xxErrors: 5
+      interval: 10s
+      baseEjectionTime: 30s
+      minHealthPercent: 50
+---
+# Telemetry: sample traces at the mesh layer to match the application's rate,
+# so a request is either fully traced or not traced at all rather than
+# half-sampled.
+apiVersion: telemetry.istio.io/v1alpha1
+kind: Telemetry
+metadata:
+  name: mesh-default
+  namespace: messaging
+spec:
+  tracing:
+    - randomSamplingPercentage: 5.0
+  accessLogging:
+    - providers:
+        - name: envoy
+      # Log only what failed. Access-logging every request in a chat platform
+      # produces more log volume than the messages themselves.
+      filter:
+        expression: "response.code >= 400"
+---
+# admin-service is the moderation surface: ban an account, resolve a report,
+# look up a user. It has no route through the public load balancer, and this
+# policy is the second half of that boundary.
+#
+# The service trusts the X-Goog-Authenticated-User-Email header that IAP sets,
+# exactly as chat-service trusts X-User-Id from the gateway, and for the same
+# reason: nothing else can reach it. Note the consequence — **if this policy is
+# removed, that header becomes an authentication bypass on the one service that
+# can ban accounts.** It ships in the same kustomize base as the Deployment so
+# it cannot be deployed without it.
+#
+# Deliberately no second rule. Every other service here has a fallback rule
+# allowing /v1 from anywhere in the mesh; this one has none, so a workload that
+# is not the operator gateway is denied outright rather than reaching a handler
+# that then has to decide.
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: admin-service-operators-only
+  namespace: messaging
+spec:
+  selector:
+    matchLabels:
+      app: admin-service
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals:
+              - "cluster.local/ns/messaging/sa/operator-gateway"
+      to:
+        - operation:
+            paths: ["/admin/*"]
+    # Health and metrics for the platform's own probes, on the admin port
+    # only. Without this the readiness probe fails and the Deployment never
+    # becomes available.
+    - to:
+        - operation:
+            ports: ["9090"]
+            paths: ["/healthz", "/readyz", "/metrics"]

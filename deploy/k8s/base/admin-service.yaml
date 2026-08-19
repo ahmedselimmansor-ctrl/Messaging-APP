@@ -1,0 +1,141 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: admin-service
+  namespace: messaging
+  labels: { app: admin-service, tier: internal }
+spec:
+  # Two, for availability during a rollout rather than for capacity. This
+  # serves a handful of staff; it will never be the thing that needs scaling.
+  replicas: 2
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels: { app: admin-service }
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }
+  template:
+    metadata:
+      labels: { app: admin-service, tier: internal }
+      annotations:
+        proxy.istio.io/config: |
+          holdApplicationUntilProxyStarts: true
+    spec:
+      serviceAccountName: admin-service
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      nodeSelector: { workload: stateless }
+      containers:
+        - name: admin-service
+          image: IMAGE_REPOSITORY/admin-service:latest
+          ports:
+            - { name: http, containerPort: 8080 }
+            - { name: admin, containerPort: 9090 }
+          envFrom:
+            - configMapRef: { name: platform-config }
+          env:
+            - { name: SERVICE_NAME, value: admin-service }
+            - name: HOSTNAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - { name: GOMEMLIMIT, value: "200MiB" }
+            # Postgres identity comes from Workload Identity through the
+            # Cloud SQL proxy's --auto-iam-authn, as it does for every other
+            # service here — there is no password. The svc_admin role's grants
+            # (migration 0007) are what bound it: reports, ban columns, and the
+            # user/chat/device rows a moderator needs. Explicitly NOT the phone
+            # column, and no Cassandra credential at all.
+          startupProbe:
+            httpGet: { path: /readyz, port: admin }
+            periodSeconds: 2
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: { path: /readyz, port: admin }
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: { path: /healthz, port: admin }
+            periodSeconds: 15
+            failureThreshold: 5
+          lifecycle:
+            preStop: { exec: { command: ["/bin/sleep", "5"] } }
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { memory: 256Mi }
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+        # The Cloud SQL proxy, as every Postgres client here has. IAM
+        # authentication means no database password exists for this service.
+        - name: cloudsql-proxy
+          image: gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.14.1
+          restartPolicy: Always
+          args: ["--structured-logs", "--auto-iam-authn", "--private-ip",
+                 "--health-check", "--http-address=0.0.0.0", "--http-port=9801",
+                 "--max-sigterm-delay=30s", "$(CLOUDSQL_CONNECTION_NAME)"]
+          env:
+            - name: CLOUDSQL_CONNECTION_NAME
+              valueFrom: { configMapKeyRef: { name: platform-config, key: CLOUDSQL_CONNECTION_NAME } }
+          ports: [{ containerPort: 5432, name: postgres }]
+          startupProbe:
+            httpGet: { path: /startup, port: 9801 }
+            periodSeconds: 1
+            failureThreshold: 60
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 128Mi }
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+      volumes:
+        - name: tmp
+          emptyDir: { sizeLimit: 32Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: admin-service
+  namespace: messaging
+  labels: { app: admin-service }
+spec:
+  selector: { app: admin-service }
+  ports:
+    - { name: http, port: 80, targetPort: http }
+    - { name: admin, port: 9090, targetPort: admin }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: { name: admin-service, namespace: messaging }
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: { app: admin-service }
+---
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata: { name: admin-service, namespace: messaging }
+spec:
+  selector:
+    matchLabels: { app: admin-service }
+  endpoints:
+    - { port: admin, path: /metrics, interval: 30s }
+---
+# No HorizontalPodAutoscaler, deliberately. Load here comes from staff, not
+# users, so there is nothing to autoscale against — and an HPA on a service
+# with two replicas and no traffic just adds a controller that can get it
+# wrong.
+#
+# There is also no Ingress, no BackendConfig and no entry in the public
+# gateway's routing. That absence is the primary control: this service is not
+# addressable from the internet, and the AuthorizationPolicy in
+# deploy/k8s/mesh restricts it further to the operator gateway's identity.

@@ -1,0 +1,170 @@
+# coturn — the TURN relay for calls that cannot go peer-to-peer.
+#
+# Roughly 15-20% of calls need a relay, because symmetric NATs and some
+# corporate firewalls refuse a direct path. Without TURN those calls simply
+# fail, and the failure looks like "the app doesn't work on my network".
+#
+# Two things make this deployment unusual, and both are unavoidable:
+#
+#  1. hostNetwork. TURN allocates a wide range of UDP ports and hands their
+#     addresses to peers. Behind a Service those addresses are wrong, and the
+#     relay silently does not work.
+#  2. No mesh sidecar. Envoy cannot carry the relayed media, and would break
+#     the address discovery that TURN depends on.
+#
+# The mitigation for both is that coturn holds no application data: it relays
+# encrypted media between two peers and cannot decrypt any of it.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coturn
+  namespace: messaging
+  labels: { app: coturn, tier: media }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: coturn }
+  template:
+    metadata:
+      labels: { app: coturn, tier: media }
+      annotations:
+        sidecar.istio.io/inject: "false"
+    spec:
+      # Needed for Workload Identity: the CSI mount below fetches the TURN
+      # secret as this service account, so it must be one with an IAM binding
+      # rather than the namespace default.
+      serviceAccountName: coturn
+      # Host networking, for the reason above.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      terminationGracePeriodSeconds: 30
+
+      nodeSelector: { workload: realtime }
+      tolerations:
+        - key: workload
+          operator: Equal
+          value: realtime
+          effect: NoSchedule
+
+      # One per node: they share the host's port range, so two on a node
+      # would collide.
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app
+                    operator: In
+                    values: [coturn]
+              topologyKey: kubernetes.io/hostname
+
+      containers:
+        - name: coturn
+          image: coturn/coturn:4.6
+          args:
+            - -n                              # no config file; everything is a flag
+            - --log-file=stdout
+            - --listening-port=3478
+            - --tls-listening-port=5349
+            - --min-port=49152
+            - --max-port=65535
+            # The REST API mechanism: credentials are an expiry plus an HMAC,
+            # so there is no user database and every credential expires on its
+            # own. pkg/turn mints them with the same secret.
+            - --use-auth-secret
+            - --static-auth-secret=$(TURN_SECRET)
+            - --realm=$(TURN_REALM)
+            # Refuse to relay to private ranges. Without these a TURN server
+            # is a proxy into the cluster's own network — the single most
+            # common way an open relay becomes a breach rather than a bill.
+            - --no-multicast-peers
+            - --denied-peer-ip=10.0.0.0-10.255.255.255
+            - --denied-peer-ip=172.16.0.0-172.31.255.255
+            - --denied-peer-ip=192.168.0.0-192.168.255.255
+            - --denied-peer-ip=169.254.0.0-169.254.255.255
+            - --denied-peer-ip=127.0.0.0-127.255.255.255
+            - --denied-peer-ip=::1
+            - --denied-peer-ip=fc00::-fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+            # Bound one allocation's bandwidth and lifetime, so a single
+            # client cannot consume the node.
+            - --max-bps=1000000
+            - --bps-capacity=0
+            - --user-quota=12
+            - --total-quota=1200
+            - --stale-nonce=600
+            # CLI and Prometheus off: the CLI is an unauthenticated admin
+            # channel on a host-networked pod.
+            - --no-cli
+            - --prometheus
+          env:
+            - name: TURN_SECRET
+              valueFrom:
+                secretKeyRef: { name: turn-secret, key: secret }
+            - { name: TURN_REALM, value: "example.com" }
+            - name: EXTERNAL_IP
+              valueFrom:
+                fieldRef: { fieldPath: status.hostIP }
+          ports:
+            - { name: turn-udp, containerPort: 3478, protocol: UDP, hostPort: 3478 }
+            - { name: turn-tcp, containerPort: 3478, protocol: TCP, hostPort: 3478 }
+            - { name: turns, containerPort: 5349, protocol: TCP, hostPort: 5349 }
+            - { name: metrics, containerPort: 9641, protocol: TCP }
+          resources:
+            requests:
+              cpu: 500m
+              # Relaying is memory-light and network-heavy: the constraint is
+              # the node's bandwidth, not its RAM.
+              memory: 256Mi
+            limits:
+              memory: 512Mi
+          livenessProbe:
+            tcpSocket: { port: 3478 }
+            periodSeconds: 30
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              # Binding the privileged 3478/5349 ports on the host.
+              add: ["NET_BIND_SERVICE"]
+          volumeMounts:
+            # Mounted even though the value is consumed through the env var
+            # above. The CSI driver only creates and refreshes the Kubernetes
+            # Secret named in secretObjects while some pod mounts the volume —
+            # without this mount the secretKeyRef never resolves and coturn
+            # cannot start.
+            - { name: secrets, mountPath: /var/secrets, readOnly: true }
+      volumes:
+        - name: secrets
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes: { secretProviderClass: coturn-secrets }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: coturn
+  namespace: messaging
+  labels: { app: coturn }
+spec:
+  clusterIP: None
+  selector: { app: coturn }
+  ports:
+    - { name: metrics, port: 9641, targetPort: metrics }
+---
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata: { name: coturn, namespace: messaging }
+spec:
+  selector:
+    matchLabels: { app: coturn }
+  endpoints:
+    - { port: metrics, path: /metrics, interval: 30s }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: { name: coturn, namespace: messaging }
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels: { app: coturn }

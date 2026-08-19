@@ -1,0 +1,35 @@
+# Build artifacts
+coverage.out
+coverage.html
+/bin/
+/dist/
+
+# Local development keys and secrets. Never commit these — the MTProto key is
+# what clients pin, and the JWT key can mint a token for any account.
+/local/
+*.pem
+*.key
+!deploy/**/*.pem.example
+
+# Terraform
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+
+# Rendered manifests
+/rendered-*.yaml
+
+# Editors
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Go
+vendor/

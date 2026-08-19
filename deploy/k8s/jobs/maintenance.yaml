@@ -1,0 +1,149 @@
+# Scheduled maintenance.
+#
+# Cassandra repair is the one that must not be skipped: anti-entropy repair
+# has to complete within gc_grace_seconds (three days, per the schema) or
+# deleted data can resurrect.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: cassandra-repair
+  namespace: data
+spec:
+  # Weekly, Sunday 02:00. Repair is IO-heavy, so it runs when traffic is
+  # lowest.
+  schedule: "0 2 * * 0"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  # If the cluster was down at the scheduled time, do not run a repair four
+  # hours late into the morning peak.
+  startingDeadlineSeconds: 3600
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      # Repair of a large ring genuinely takes hours; killing it partway
+      # leaves the ring no better off than before.
+      activeDeadlineSeconds: 43200
+      template:
+        metadata:
+          annotations:
+            sidecar.istio.io/inject: "false"
+        spec:
+          restartPolicy: Never
+          nodeSelector: { workload: stateless }
+          containers:
+            - name: repair
+              image: cassandra:5.0
+              command: ["/bin/bash", "-ec"]
+              args:
+                - |
+                  set -o pipefail
+                  # -pr repairs only this node's primary ranges, so running it
+                  # on every node covers the ring exactly once instead of
+                  # six times over.
+                  for i in $(seq 0 5); do
+                    host="cassandra-$i.cassandra.data.svc.cluster.local"
+                    echo "=== repairing $host ==="
+                    nodetool -h "$host" repair -pr --full messaging || {
+                      echo "repair failed on $host"
+                      exit 1
+                    }
+                  done
+              resources:
+                requests: { cpu: 200m, memory: 512Mi }
+                limits: { memory: 1Gi }
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: cassandra-snapshot
+  namespace: data
+spec:
+  schedule: "0 1 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        metadata:
+          annotations:
+            sidecar.istio.io/inject: "false"
+        spec:
+          restartPolicy: Never
+          serviceAccountName: cassandra
+          nodeSelector: { workload: stateless }
+          containers:
+            - name: snapshot
+              image: google/cloud-sdk:slim
+              command: ["/bin/bash", "-ec"]
+              args:
+                - |
+                  TAG="daily-$(date +%Y%m%d)"
+                  for i in $(seq 0 5); do
+                    host="cassandra-$i.cassandra.data.svc.cluster.local"
+                    # A snapshot is a set of hard links: instant, and free
+                    # until compaction moves on. It does pin disk, which is
+                    # why the clear at the end is not optional.
+                    nodetool -h "$host" snapshot -t "$TAG" messaging
+                  done
+                  echo "snapshots created as $TAG"
+                  echo "upload runs from a per-node sidecar; see docs/RUNBOOK.md"
+                  for i in $(seq 0 5); do
+                    host="cassandra-$i.cassandra.data.svc.cluster.local"
+                    nodetool -h "$host" clearsnapshot -t "$TAG" messaging
+                  done
+              resources:
+                requests: { cpu: 100m, memory: 256Mi }
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: otp-purge
+  namespace: messaging
+spec:
+  # Hourly. Expired challenges are useless and the table is on the login path,
+  # so keeping it small keeps that path fast.
+  schedule: "17 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        metadata:
+          annotations:
+            sidecar.istio.io/inject: "false"
+        spec:
+          restartPolicy: Never
+          serviceAccountName: auth-service
+          nodeSelector: { workload: stateless }
+          initContainers:
+            - name: cloudsql-proxy
+              image: gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.14.1
+              restartPolicy: Always
+              args: ["--structured-logs", "--auto-iam-authn", "--private-ip",
+                     "--health-check", "--http-address=0.0.0.0", "--http-port=9801",
+                     "$(CLOUDSQL_CONNECTION_NAME)"]
+              env:
+                - name: CLOUDSQL_CONNECTION_NAME
+                  valueFrom: { configMapKeyRef: { name: platform-config, key: CLOUDSQL_CONNECTION_NAME } }
+              startupProbe:
+                httpGet: { path: /startup, port: 9801 }
+                periodSeconds: 1
+                failureThreshold: 30
+              resources:
+                requests: { cpu: 50m, memory: 64Mi }
+          containers:
+            - name: purge
+              image: IMAGE_REPOSITORY/migrate:latest
+              command: ["/bin/sh", "-ec"]
+              args:
+                - |
+                  psql "$POSTGRES_DSN" -v ON_ERROR_STOP=1 -c \
+                    "DELETE FROM otp_challenges WHERE expires_at < now() - interval '1 day';"
+              env:
+                - name: POSTGRES_DSN
+                  valueFrom: { configMapKeyRef: { name: platform-config, key: POSTGRES_DSN } }
+              resources:
+                requests: { cpu: 50m, memory: 64Mi }

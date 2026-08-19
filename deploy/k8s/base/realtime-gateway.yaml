@@ -1,0 +1,315 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: realtime-gateway
+  namespace: messaging
+  labels:
+    app: realtime-gateway
+    tier: realtime
+spec:
+  replicas: 3
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app: realtime-gateway
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # One at a time, never below full capacity. Each pod holds tens of
+      # thousands of connections and takes a full drain window to release
+      # them; replacing two at once would double the reconnect burst.
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: realtime-gateway
+        tier: realtime
+      annotations:
+        # The gateway's TCP and UDP listeners are reached through the Network
+        # Load Balancer in passthrough mode, which means the traffic arrives
+        # on the pod IP without going through the mesh. Excluding those ports
+        # from the sidecar's inbound capture is what makes that work — without
+        # it, Envoy intercepts raw MTProto and cannot parse it.
+        traffic.sidecar.istio.io/excludeInboundPorts: "4443"
+        traffic.sidecar.istio.io/includeInboundPorts: "8080"
+    spec:
+      serviceAccountName: realtime-gateway
+
+      # The longest grace period in the platform, and it is the point: on
+      # SIGTERM the gateway tells every connected client to reconnect
+      # elsewhere and waits for them to act on it. Cutting this short
+      # produces the reconnect storm the drain exists to prevent.
+      terminationGracePeriodSeconds: 120
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          # DoNotSchedule, not ScheduleAnyway: an uneven spread here means a
+          # zone failure drops a disproportionate share of live connections.
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: realtime-gateway
+
+      # The realtime node pool is tainted so nothing else competes for its
+      # file descriptors and network buffers.
+      nodeSelector:
+        workload: realtime
+      tolerations:
+        - key: workload
+          operator: Equal
+          value: realtime
+          effect: NoSchedule
+
+      containers:
+        - name: realtime-gateway
+          image: IMAGE_REPOSITORY/realtime-gateway:latest
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: mtproto
+              containerPort: 4443
+              protocol: TCP
+              # hostPort so the Network Load Balancer, which targets node
+              # addresses rather than pod addresses, reaches this pod. It is
+              # the reason only one gateway pod can run per node — which is
+              # also what makes the per-pod connection limit meaningful.
+              hostPort: 4443
+            - name: mtproto-udp
+              containerPort: 4443
+              protocol: UDP
+              hostPort: 4443
+            - name: ws
+              containerPort: 8080
+              protocol: TCP
+            - name: admin
+              containerPort: 9090
+              protocol: TCP
+
+          envFrom:
+            - configMapRef:
+                name: platform-config
+          env:
+            - name: SERVICE_NAME
+              value: realtime-gateway
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: GOMEMLIMIT
+              value: "6700MiB"
+            - name: GOMAXPROCS
+              value: "4"
+            # The MTProto RSA private key, projected from Secret Manager by
+            # the CSI driver as a file. It never becomes a Kubernetes Secret,
+            # so it is not in etcd and not readable by anything else in the
+            # namespace, and it rotates without a redeploy.
+            - { name: MTPROTO_SERVER_KEY_PEM_FILE, value: /var/secrets/mtproto-server-key.pem }
+
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: admin
+            periodSeconds: 2
+            failureThreshold: 60
+
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: admin
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+            periodSeconds: 15
+            failureThreshold: 5
+
+          lifecycle:
+            preStop:
+              exec:
+                # Longer than elsewhere: the load balancer's health check runs
+                # every 5s and needs six failures to eject this node, so we
+                # keep serving for 15s while it does.
+                command: ["/bin/sleep", "15"]
+
+          resources:
+            requests:
+              cpu: "2"
+              # Memory is the real constraint: roughly 8KB of buffers per
+              # connection, so 40k connections is ~320MB of buffers plus heap
+              # and Go runtime overhead. 8Gi leaves comfortable headroom.
+              memory: 4Gi
+            limits:
+              memory: 8Gi
+
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: secrets
+              mountPath: /var/secrets
+              readOnly: true
+
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+        - name: secrets
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: gateway-secrets
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: realtime-gateway
+  namespace: messaging
+  labels:
+    app: realtime-gateway
+  annotations:
+    # The WebSocket path goes through the HTTPS load balancer, so it needs a
+    # NEG the Gateway controller can attach to a backend service.
+    cloud.google.com/neg: '{"exposed_ports": {"8080":{"name":"realtime-gateway-ws"}}}'
+    cloud.google.com/backend-config: '{"default": "realtime-gateway-backendconfig"}'
+spec:
+  selector:
+    app: realtime-gateway
+  ports:
+    - name: ws
+      port: 80
+      targetPort: ws
+      protocol: TCP
+    - name: admin
+      port: 9090
+      targetPort: admin
+      protocol: TCP
+  type: ClusterIP
+---
+apiVersion: cloud.google.com/v1
+kind: BackendConfig
+metadata:
+  name: realtime-gateway-backendconfig
+  namespace: messaging
+spec:
+  # WebSocket connections are long-lived. The default 30s backend timeout
+  # would sever every one of them; 3600s lets a connection live an hour, and
+  # the client's 60s ping keeps it from being idle-reaped before that.
+  timeoutSec: 3600
+
+  connectionDraining:
+    drainingTimeoutSec: 120
+
+  healthCheck:
+    type: HTTP
+    port: 9090
+    requestPath: /readyz
+    checkIntervalSec: 5
+    timeoutSec: 3
+    healthyThreshold: 2
+    unhealthyThreshold: 6
+
+  # Cloud CDN is meaningless for a WebSocket and would break the upgrade.
+  cdn:
+    enabled: false
+
+  logging:
+    enable: true
+    sampleRate: 0.1
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: realtime-gateway
+  namespace: messaging
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: realtime-gateway
+  minReplicas: 3
+  maxReplicas: 60
+  metrics:
+    # Connection count is the real capacity signal here, not CPU. A pod
+    # holding 40k idle connections uses almost no CPU and is nonetheless full.
+    - type: Pods
+      pods:
+        metric:
+          name: prometheus.googleapis.com|messaging_realtime_connections|gauge
+        target:
+          type: AverageValue
+          # Scale out at 30k per pod, well below the 40k hard limit, so new
+          # pods are ready before the existing ones start refusing.
+          averageValue: "30000"
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Pods
+          value: 3
+          periodSeconds: 60
+    scaleDown:
+      # Fifteen minutes. Every scale-down migrates thousands of live
+      # connections; doing it eagerly would mean constant reconnects for
+      # users whose only crime was being connected during a lull.
+      stabilizationWindowSeconds: 900
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 300
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: realtime-gateway
+  namespace: messaging
+spec:
+  # At most one gateway pod may be voluntarily disrupted at a time, whatever
+  # the replica count.
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: realtime-gateway
+---
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: realtime-gateway
+  namespace: messaging
+spec:
+  selector:
+    matchLabels:
+      app: realtime-gateway
+  endpoints:
+    - port: admin
+      path: /metrics
+      interval: 15s

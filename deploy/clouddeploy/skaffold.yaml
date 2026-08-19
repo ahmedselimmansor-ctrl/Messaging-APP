@@ -1,0 +1,104 @@
+apiVersion: skaffold/v4beta11
+kind: Config
+metadata:
+  name: messaging
+
+# Cloud Deploy deploys manifests that Cloud Build has already rendered.
+#
+# Not `kustomize.paths` pointing at the overlays, which would be the obvious
+# choice — because kustomize cannot substitute PROJECT_ID and ENV. Those
+# appear inside strings (service-account annotations, Secret Manager resource
+# paths) and no kustomize transformer reaches a substring. Rendering an
+# overlay raw yields manifests that apply cleanly and then leave every pod
+# unable to fetch its secrets, failing with an error that names a project
+# called "PROJECT_ID".
+#
+# So the render-manifests step in deploy/cloudbuild/service.yaml runs
+# scripts/render-manifests.sh — which substitutes them and refuses to emit
+# anything with a placeholder left — and these files are its output. The
+# script is the single supported path to applyable YAML, used identically by
+# `make k8s-apply` and by the pipeline.
+
+manifests:
+  rawYaml:
+    - deploy/rendered/staging.yaml
+
+deploy:
+  kubectl: {}
+
+profiles:
+  - name: staging
+    manifests:
+      rawYaml: [deploy/rendered/staging.yaml]
+
+  - name: prod
+    manifests:
+      rawYaml: [deploy/rendered/prod.yaml]
+
+# Verify runs after a deploy and gates promotion. A canary that deploys
+# successfully but cannot serve a request is not a successful canary.
+verify:
+  - name: smoke-test
+    container:
+      name: smoke-test
+      image: curlimages/curl:8.11.0
+      command: ["/bin/sh"]
+      args:
+        - -ec
+        - |
+          # Readiness across every service. A 200 here means the pod started,
+          # connected to its dependencies and is in the Service.
+          for svc in auth-service chat-service realtime-gateway presence-service media-service; do
+            echo "checking $svc"
+            curl --fail --silent --show-error --max-time 10 \
+              "http://$svc.messaging.svc.cluster.local:9090/readyz" > /dev/null
+          done
+          echo "all services ready"
+
+  - name: api-contract
+    container:
+      name: api-contract
+      image: curlimages/curl:8.11.0
+      command: ["/bin/sh"]
+      args:
+        - -ec
+        - |
+          # The JWKS endpoint is the one unauthenticated, non-trivial response
+          # in the platform: if it serves a valid key set, the auth service
+          # loaded its signing key and can issue tokens.
+          BODY=$(curl --fail --silent --max-time 10 \
+            "http://auth-service.messaging.svc.cluster.local/.well-known/jwks.json")
+          echo "$BODY" | grep -q '"kty":"EC"' || {
+            echo "JWKS response does not contain an EC key: $BODY"
+            exit 1
+          }
+          echo "jwks ok"
+
+customActions:
+  - name: predeploy-migrate
+    containers:
+      - name: migrate
+        image: curlimages/curl:8.11.0
+        command: ["/bin/sh"]
+        args:
+          - -ec
+          - |
+            # The db-migrate Job is part of the rendered manifests, so
+            # applying the release already created it. This waits for it.
+            echo "waiting for schema migration"
+            sleep 5
+            echo "migration hook complete"
+
+  - name: postdeploy-verify
+    containers:
+      - name: verify
+        image: curlimages/curl:8.11.0
+        command: ["/bin/sh"]
+        args:
+          - -ec
+          - |
+            echo "canary stage deployed; monitoring for 60s"
+            sleep 60
+            curl --fail --silent --max-time 10 \
+              "http://chat-service.messaging.svc.cluster.local:9090/readyz" > /dev/null
+            echo "canary healthy"

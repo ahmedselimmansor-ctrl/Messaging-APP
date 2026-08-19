@@ -1,0 +1,232 @@
+# Local development stack.
+#
+# This is the whole data layer on a laptop: Kafka, Cassandra, Postgres, Redis
+# and Elasticsearch. It exists so that "does the send path work end to end"
+# is answerable without a GCP project, and so the integration tests have
+# something real to run against rather than mocks.
+#
+# It deliberately mirrors production topology where that is cheap (KRaft
+# Kafka, the same Cassandra major version, the same Postgres major version)
+# and diverges where mirroring would be pointless (single nodes, no TLS, no
+# IAM auth).
+#
+#   make dev-up      start everything and wait for health
+#   make dev-migrate apply the schemas
+#   make run-all     run the services against it
+#   make dev-down    stop, keeping data
+#   make dev-clean   stop and delete the volumes
+
+name: messaging-dev
+
+services:
+  # ---------------------------------------------------------------------------
+  # Kafka, KRaft mode
+  # ---------------------------------------------------------------------------
+  #
+  # No ZooKeeper: Managed Kafka on GCP is KRaft, and running ZooKeeper locally
+  # would mean testing against an architecture we do not deploy.
+  kafka:
+    image: apache/kafka:3.9.0
+    container_name: messaging-kafka
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://:19092,CONTROLLER://:9093,EXTERNAL://:9092
+      # Two advertised listeners: containers reach the broker as kafka:19092,
+      # processes on the host reach it as localhost:9092. Getting this wrong
+      # is the single most common way a local Kafka appears to work and then
+      # hands the client an unreachable address on the first produce.
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:19092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      # A single broker cannot replicate; production uses RF=3.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Off, so a missing topic fails loudly here exactly as it would in
+      # production, where Terraform owns topic creation.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_RETENTION_HOURS: 24
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:19092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 30s
+
+  # Creates the topics Terraform creates in production. Runs once and exits.
+  kafka-init:
+    image: apache/kafka:3.9.0
+    container_name: messaging-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-ec"]
+    command:
+      - |
+        create() {
+          /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:19092 \
+            --create --if-not-exists --topic "$$1" --partitions "$$2" --replication-factor 1
+        }
+        create messages.raw 8
+        create messages.persisted 8
+        create presence.events 4
+        create notifications.push 4
+        create media.processing 2
+        create user.events 2
+        create search.index 4
+        create media.processed 2
+        create platform.dlq 1
+        create platform.audit 1
+        echo "--- topics ---"
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:19092 --list
+
+  # ---------------------------------------------------------------------------
+  # Cassandra
+  # ---------------------------------------------------------------------------
+  cassandra:
+    image: cassandra:5.0
+    container_name: messaging-cassandra
+    ports:
+      - "9042:9042"
+    environment:
+      CASSANDRA_CLUSTER_NAME: messaging
+      CASSANDRA_DC: europe-west1
+      CASSANDRA_RACK: rack1
+      CASSANDRA_ENDPOINT_SNITCH: GossipingPropertyFileSnitch
+      CASSANDRA_NUM_TOKENS: 16
+      # Small heap: a laptop does not have 8GB to give Cassandra, and the
+      # local dataset is tiny.
+      MAX_HEAP_SIZE: 1G
+      HEAP_NEWSIZE: 256M
+      JVM_OPTS: "-Dcassandra.skip_wait_for_gossip_to_settle=0 -Dcassandra.initial_token="
+    volumes:
+      - cassandra-data:/var/lib/cassandra
+    healthcheck:
+      test: ["CMD-SHELL", "cqlsh -e 'describe keyspaces' >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 10s
+      retries: 30
+      # Cassandra genuinely takes a minute to come up.
+      start_period: 90s
+
+  # ---------------------------------------------------------------------------
+  # Postgres
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: messaging-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: messaging
+      POSTGRES_USER: messaging
+      POSTGRES_PASSWORD: localdev
+      # Faster initdb on a laptop; irrelevant to production, where Cloud SQL
+      # handles this.
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+    command:
+      - postgres
+      # Match the production flags that affect behaviour, so a query that
+      # works here works there.
+      - -c
+      - log_min_duration_statement=1000
+      - -c
+      - idle_in_transaction_session_timeout=30000
+      - -c
+      - max_connections=200
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U messaging -d messaging"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # ---------------------------------------------------------------------------
+  # Redis
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7.4-alpine
+    container_name: messaging-redis
+    ports:
+      - "6379:6379"
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      # noeviction, matching production. The instinct is allkeys-lru and it is
+      # wrong: this holds the per-chat sequence counters, and silently evicting
+      # one would corrupt message ordering.
+      - --maxmemory-policy
+      - noeviction
+      - --notify-keyspace-events
+      - Ex
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ---------------------------------------------------------------------------
+  # Elasticsearch
+  # ---------------------------------------------------------------------------
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.3
+    container_name: messaging-elasticsearch
+    ports:
+      - "9200:9200"
+    environment:
+      discovery.type: single-node
+      # Security off locally. In production this is Elastic Cloud with API-key
+      # authentication; running the full security stack on a laptop adds
+      # certificate management for no test coverage.
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+      bootstrap.memory_lock: "true"
+    ulimits:
+      memlock: { soft: -1, hard: -1 }
+    volumes:
+      - elasticsearch-data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # Kafka UI — optional, for looking at what is actually on a topic
+  # ---------------------------------------------------------------------------
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: messaging-kafka-ui
+    profiles: [tools]
+    ports:
+      - "8090:8080"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:19092
+      DYNAMIC_CONFIG_ENABLED: "true"
+
+volumes:
+  kafka-data:
+  cassandra-data:
+  postgres-data:
+  redis-data:
+  elasticsearch-data:

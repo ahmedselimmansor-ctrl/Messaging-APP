@@ -1,0 +1,56 @@
+# golangci-lint configuration.
+#
+# The philosophy: every enabled linter must catch a class of bug that has
+# actually caused an incident somewhere. Style linters that only produce
+# churn are off — the formatter already handles style.
+
+version: "2"
+
+run:
+  timeout: 10m
+  tests: true
+
+linters:
+  default: none
+  enable:
+    - errcheck      # an unchecked error is the most common Go bug
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - bodyclose     # a leaked response body leaks a connection
+    - contextcheck  # a dropped context breaks cancellation and tracing
+    - errorlint     # errors.Is/As rather than == and type assertions
+    - nilerr        # returning nil after checking err != nil
+    - rowserrcheck
+    - sqlclosecheck
+    - noctx         # an HTTP request without a context cannot be cancelled
+    - gosec
+
+  settings:
+    errcheck:
+      # Deliberately-ignored writes to a response or a discard sink.
+      exclude-functions:
+        - (net/http.ResponseWriter).Write
+        - (io.Writer).Write
+    gosec:
+      excludes:
+        # math/rand for frame padding is intentional and documented in place:
+        # the padding carries no secret and only needs to be unpredictable to
+        # an observer counting bytes.
+        - G404
+        # SHA-1 appears only as an identifier (auth key ids, RSA
+        # fingerprints) and inside MTProto's specified KDF, never as a
+        # security primitive on its own.
+        - G401
+        - G505
+
+  exclusions:
+    rules:
+      # Tests may ignore errors and use weak randomness freely.
+      - path: _test\.go
+        linters: [errcheck, gosec, noctx]
+
+formatters:
+  enable:
+    - gofmt

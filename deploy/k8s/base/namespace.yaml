@@ -1,0 +1,74 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: messaging
+  labels:
+    # Enrols the namespace in managed Anthos Service Mesh. Every pod gets an
+    # Envoy sidecar and mTLS between services becomes automatic — which is
+    # what lets the chat service trust the X-User-Id header the gateway sets
+    # on internal calls.
+    istio.io/rev: asm-managed
+    # Pod Security Standards, enforced. "restricted" forbids privileged
+    # containers, host namespaces, host paths and running as root. Anything
+    # that needs an exception has to ask for it explicitly rather than
+    # inheriting permission by default.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: data
+  labels:
+    istio.io/rev: asm-managed
+    # Cassandra needs to set sysctls and mount local NVMe, neither of which
+    # "restricted" allows. It is confined by its own NetworkPolicy and node
+    # taint instead — a narrower blast radius than relaxing the whole
+    # messaging namespace would be.
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+---
+# ResourceQuota is a guardrail, not a capacity plan: it stops one runaway
+# Deployment from consuming the cluster before the autoscaler's ceiling does.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: messaging-quota
+  namespace: messaging
+spec:
+  hard:
+    requests.cpu: "200"
+    requests.memory: 800Gi
+    limits.cpu: "400"
+    limits.memory: 1600Gi
+    persistentvolumeclaims: "20"
+    # A Service of type LoadBalancer creates a real, billed forwarding rule.
+    # Two is all this platform should ever need; a third is a mistake.
+    services.loadbalancers: "2"
+---
+# Without a LimitRange, a pod with no resource requests is scheduled as
+# best-effort and is the first thing evicted under memory pressure — usually
+# at the worst possible moment. This makes forgetting requests impossible.
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: messaging-defaults
+  namespace: messaging
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: 500m
+        memory: 512Mi
+      defaultRequest:
+        cpu: 100m
+        memory: 128Mi
+      max:
+        cpu: "8"
+        memory: 32Gi
+      min:
+        cpu: 10m
+        memory: 32Mi

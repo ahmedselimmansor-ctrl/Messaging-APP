@@ -1,0 +1,20 @@
+# Migration runner: psql plus the SQL files.
+#
+# Separate from the service image because it needs a shell and a postgres
+# client, neither of which belong in a distroless runtime image. It runs as a
+# Job, once, and is never exposed to the network.
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends postgresql-client-16 ca-certificates \
+ || apt-get install -y --no-install-recommends postgresql-client ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+# The same uid as the service images, so a shared volume behaves predictably.
+RUN groupadd -g 65532 nonroot && useradd -u 65532 -g 65532 -m nonroot
+USER 65532:65532
+
+COPY --chown=65532:65532 db/postgres/migrations /migrations
+COPY --chown=65532:65532 db/cassandra /cassandra
+
+ENTRYPOINT ["/bin/sh"]

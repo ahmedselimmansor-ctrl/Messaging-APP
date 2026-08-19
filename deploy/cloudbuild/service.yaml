@@ -1,0 +1,296 @@
+# Cloud Build pipeline for one service.
+#
+# One file parameterised by _SERVICE rather than nine near-identical files:
+# the steps are the same for every service, and nine copies means nine places
+# to forget a security scan.
+#
+# Invoked by a trigger per service with --included-files scoped to that
+# service's directory plus the shared packages, so a change to one service
+# does not rebuild the other eight — and a change to pkg/ correctly rebuilds
+# all of them.
+
+substitutions:
+  _SERVICE: ""            # required
+  _SERVICE_PATH: ""       # path under services/, e.g. "chat-service" or "consumers/persister"
+  _REGION: "europe-west1"
+  _REPOSITORY: "messaging-app"
+  _ENV: "staging"
+  _CLUSTER: ""
+  _ATTESTOR: ""
+  _KMS_KEY: ""
+  # Fail the build if the image has a vulnerability at or above this severity.
+  _MAX_SEVERITY: "HIGH"
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: E2_HIGHCPU_8
+  # A larger disk than the default: the Go build cache plus the module cache
+  # plus the image layers do not fit in 10GB once a few services have run.
+  diskSizeGb: 100
+  dynamicSubstitutions: true
+  substitutionOption: ALLOW_LOOSE
+  requestedVerifyOption: VERIFIED
+
+timeout: 1800s
+
+images: []   # pushed explicitly below so the digest can be captured
+
+steps:
+  # -------------------------------------------------------------------------
+  # 1. Guard rails
+  # -------------------------------------------------------------------------
+  - id: validate-inputs
+    name: gcr.io/cloud-builders/gcloud
+    entrypoint: bash
+    args:
+      - -ec
+      - |
+        test -n "${_SERVICE}" || { echo "_SERVICE is required"; exit 1; }
+        test -n "${_SERVICE_PATH}" || { echo "_SERVICE_PATH is required"; exit 1; }
+        test -d "services/${_SERVICE_PATH}" || {
+          echo "services/${_SERVICE_PATH} does not exist"; exit 1;
+        }
+        echo "building ${_SERVICE} from services/${_SERVICE_PATH}"
+
+  # -------------------------------------------------------------------------
+  # 2. Static analysis, before anything expensive
+  # -------------------------------------------------------------------------
+  - id: vet
+    name: golang:1.26
+    entrypoint: bash
+    waitFor: [validate-inputs]
+    env:
+      - GOCACHE=/workspace/.gocache
+      - GOMODCACHE=/workspace/.gomodcache
+    args:
+      - -ec
+      - |
+        go vet ./...
+        # gofmt is not cosmetic here: a diff means someone edited generated
+        # or templated output by hand, which is worth catching.
+        test -z "$(gofmt -l ./pkg ./services)" || {
+          echo "these files are not gofmt-formatted:"; gofmt -l ./pkg ./services; exit 1;
+        }
+
+  - id: lint
+    name: golangci/golangci-lint:v1.62-alpine
+    entrypoint: golangci-lint
+    waitFor: [validate-inputs]
+    args: ["run", "--timeout=10m", "./..."]
+
+  # -------------------------------------------------------------------------
+  # 3. Tests
+  # -------------------------------------------------------------------------
+  - id: test
+    name: golang:1.26
+    entrypoint: bash
+    waitFor: [vet]
+    env:
+      - GOCACHE=/workspace/.gocache
+      - GOMODCACHE=/workspace/.gomodcache
+    args:
+      - -ec
+      - |
+        # -race on the full suite. The realtime gateway is heavily concurrent
+        # and a data race there is the kind of bug that only shows up in
+        # production under load.
+        go test -race -count=1 -covermode=atomic -coverprofile=/workspace/coverage.out ./...
+        go tool cover -func=/workspace/coverage.out | tail -1
+
+  # -------------------------------------------------------------------------
+  # 4. Vulnerability scan of the source tree
+  # -------------------------------------------------------------------------
+  - id: govulncheck
+    name: golang:1.26
+    entrypoint: bash
+    waitFor: [vet]
+    env:
+      - GOCACHE=/workspace/.gocache
+      - GOMODCACHE=/workspace/.gomodcache
+    args:
+      - -ec
+      - |
+        go install golang.org/x/vuln/cmd/govulncheck@latest
+        # govulncheck reports only vulnerabilities in code paths that are
+        # actually reachable, so it produces far fewer false alarms than a
+        # dependency-manifest scanner and is worth failing the build on.
+        $(go env GOPATH)/bin/govulncheck ./...
+
+  # -------------------------------------------------------------------------
+  # 5. Build
+  # -------------------------------------------------------------------------
+  - id: build-image
+    name: gcr.io/cloud-builders/docker
+    waitFor: [test, lint, govulncheck]
+    args:
+      - build
+      - --file=build/Dockerfile
+      - --build-arg=SERVICE=${_SERVICE_PATH}
+      - --build-arg=VERSION=${SHORT_SHA}
+      - --build-arg=COMMIT=${COMMIT_SHA}
+      # Reuse the previous image's layers.
+      - --cache-from=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_SERVICE}:latest
+      - --tag=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_SERVICE}:${SHORT_SHA}
+      - --tag=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_SERVICE}:latest
+      - --label=org.opencontainers.image.revision=${COMMIT_SHA}
+      - --label=org.opencontainers.image.source=https://github.com/pervagans/messaging-app
+      - .
+    env:
+      - DOCKER_BUILDKIT=1
+
+  # -------------------------------------------------------------------------
+  # 6. Push
+  # -------------------------------------------------------------------------
+  - id: push-image
+    name: gcr.io/cloud-builders/docker
+    waitFor: [build-image]
+    args:
+      - push
+      - --all-tags
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_SERVICE}
+
+  # -------------------------------------------------------------------------
+  # 7. Resolve the digest
+  # -------------------------------------------------------------------------
+  #
+  # Everything downstream — the scan, the attestation, the deploy — works on
+  # the digest, never the tag. A tag can be repointed; a digest is the image.
+  - id: resolve-digest
+    name: gcr.io/cloud-builders/gcloud
+    waitFor: [push-image]
+    entrypoint: bash
+    args:
+      - -ec
+      - |
+        DIGEST=$(gcloud artifacts docker images describe \
+          "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_SERVICE}:${SHORT_SHA}" \
+          --format='value(image_summary.digest)')
+        test -n "$DIGEST" || { echo "could not resolve the image digest"; exit 1; }
+        echo "$DIGEST" > /workspace/digest.txt
+        echo "digest: $DIGEST"
+
+  # -------------------------------------------------------------------------
+  # 8. Container vulnerability scan
+  # -------------------------------------------------------------------------
+  - id: scan-image
+    name: gcr.io/cloud-builders/gcloud
+    waitFor: [resolve-digest]
+    entrypoint: bash
+    args:
+      - -ec
+      - |
+        DIGEST=$(cat /workspace/digest.txt)
+        IMAGE="${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_SERVICE}@$DIGEST"
+
+        # Artifact Registry scans on push, but the results are not instant.
+        # Poll rather than racing them.
+        for i in $(seq 1 30); do
+          COUNT=$(gcloud artifacts docker images list-vulnerabilities "$IMAGE" \
+            --format='value(name)' 2>/dev/null | wc -l || echo "pending")
+          if [ "$COUNT" != "pending" ]; then break; fi
+          echo "waiting for the scan to complete ($i/30)"
+          sleep 10
+        done
+
+        # Fail on anything at or above the configured severity. Distroless
+        # keeps this list short; a finding here almost always means a Go
+        # dependency needs bumping.
+        FINDINGS=$(gcloud artifacts docker images list-vulnerabilities "$IMAGE" \
+          --format='value(vulnerability.effectiveSeverity)' 2>/dev/null || true)
+
+        BLOCKING=$(echo "$FINDINGS" | grep -cE "^(CRITICAL|${_MAX_SEVERITY})$" || true)
+        echo "vulnerabilities at ${_MAX_SEVERITY} or above: $BLOCKING"
+
+        if [ "$BLOCKING" -gt 0 ]; then
+          echo "--- findings ---"
+          gcloud artifacts docker images list-vulnerabilities "$IMAGE" \
+            --format='table(vulnerability.effectiveSeverity, vulnerability.shortDescription)' \
+            2>/dev/null | head -40
+          echo "build blocked: fix or explicitly waive these before deploying"
+          exit 1
+        fi
+
+  # -------------------------------------------------------------------------
+  # 9. Attest
+  # -------------------------------------------------------------------------
+  #
+  # The attestation is what Binary Authorization checks at admission. Without
+  # it the image cannot run, which is precisely the point: an image that
+  # skipped this pipeline cannot reach production even with cluster access.
+  - id: attest
+    name: gcr.io/cloud-builders/gcloud
+    waitFor: [scan-image]
+    entrypoint: bash
+    args:
+      - -ec
+      - |
+        if [ -z "${_ATTESTOR}" ]; then
+          echo "no attestor configured; skipping (expected in dev)"
+          exit 0
+        fi
+        DIGEST=$(cat /workspace/digest.txt)
+        IMAGE="${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_SERVICE}@$DIGEST"
+
+        # Idempotent: a retried build must not fail because the attestation
+        # already exists.
+        if gcloud container binauthz attestations list \
+             --attestor="${_ATTESTOR}" --artifact-url="$IMAGE" \
+             --format='value(name)' 2>/dev/null | grep -q .; then
+          echo "already attested"
+          exit 0
+        fi
+
+        gcloud container binauthz attestations sign-and-create \
+          --artifact-url="$IMAGE" \
+          --attestor="${_ATTESTOR}" \
+          --keyversion="${_KMS_KEY}"
+        echo "attested $IMAGE"
+
+  # -------------------------------------------------------------------------
+  # 10. Hand off to Cloud Deploy
+  # -------------------------------------------------------------------------
+  #
+  # Cloud Build stops here. It builds and proves; Cloud Deploy promotes. That
+  # separation is what makes a rollback a Cloud Deploy operation rather than a
+  # rebuild of an old commit.
+  # Render the manifests the release will deploy.
+  #
+  # This must happen here rather than in Cloud Deploy, because the rendered
+  # files travel with the release: a rollback then redeploys exactly the bytes
+  # that were verified, not a re-render against whatever the overlays say
+  # today.
+  - id: render-manifests
+    name: gcr.io/cloud-builders/kubectl
+    waitFor: [attest]
+    entrypoint: bash
+    args:
+      - -ec
+      - |
+        mkdir -p deploy/rendered
+        for env in staging prod; do
+          ./scripts/render-manifests.sh "$env" > "deploy/rendered/$env.yaml"
+          echo "rendered $env: $(grep -c '^kind:' "deploy/rendered/$env.yaml") resources"
+        done
+
+  - id: create-release
+    name: gcr.io/cloud-builders/gcloud
+    waitFor: [render-manifests]
+    entrypoint: bash
+    args:
+      - -ec
+      - |
+        DIGEST=$(cat /workspace/digest.txt)
+        gcloud deploy releases create "${_SERVICE}-${SHORT_SHA}" \
+          --project="$PROJECT_ID" \
+          --region="${_REGION}" \
+          --delivery-pipeline="messaging-pipeline" \
+          --images="${_SERVICE}=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_SERVICE}@$DIGEST" \
+          --annotations="commit=${COMMIT_SHA},service=${_SERVICE}" \
+          --labels="service=${_SERVICE}"
+
+artifacts:
+  objects:
+    location: gs://$PROJECT_ID-build-artifacts/${_SERVICE}/${SHORT_SHA}/
+    paths:
+      - /workspace/coverage.out
+      - /workspace/digest.txt

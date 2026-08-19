@@ -1,0 +1,20 @@
+# Generates the ConfigMap the schema Job mounts.
+#
+# It lives here, beside the CQL, rather than in deploy/k8s/jobs, because
+# kustomize refuses to read files above its own root — and the alternative,
+# copying the schema into the deploy tree, would give us two files that drift
+# apart silently. A kustomization directory referenced as a resource is allowed
+# to sit anywhere, so the CQL stays in one place and stays authoritative.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+configMapGenerator:
+  - name: cassandra-schema
+    namespace: data
+    files:
+      - schema.cql
+      - roles.cql
+    options:
+      # Not hash-suffixed. The schema Job mounts it by a fixed name, and a
+      # rolling hash would leave orphaned ConfigMaps behind on every edit.
+      disableNameSuffixHash: true

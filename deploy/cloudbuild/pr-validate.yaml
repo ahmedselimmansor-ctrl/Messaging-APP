@@ -1,0 +1,133 @@
+# Pull-request validation.
+#
+# Deliberately does not build or push an image. A PR build's job is to answer
+# "would this break anything?" as fast as possible; pushing images from
+# unreviewed code would also mean unreviewed code in the registry.
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: E2_HIGHCPU_8
+  diskSizeGb: 100
+
+timeout: 1200s
+
+steps:
+  - id: build-all
+    name: golang:1.26
+    entrypoint: bash
+    env:
+      - GOCACHE=/workspace/.gocache
+      - GOMODCACHE=/workspace/.gomodcache
+    args:
+      - -ec
+      - |
+        go build ./...
+        go vet ./...
+        test -z "$(gofmt -l ./pkg ./services)" || {
+          echo "not gofmt-formatted:"; gofmt -l ./pkg ./services; exit 1;
+        }
+
+  - id: test
+    name: golang:1.26
+    entrypoint: bash
+    waitFor: [build-all]
+    env:
+      - GOCACHE=/workspace/.gocache
+      - GOMODCACHE=/workspace/.gomodcache
+    args:
+      - -ec
+      - |
+        go test -race -count=1 -coverprofile=/workspace/coverage.out ./...
+        echo "--- coverage ---"
+        go tool cover -func=/workspace/coverage.out | tail -20
+
+  - id: lint
+    name: golangci/golangci-lint:v1.62-alpine
+    entrypoint: golangci-lint
+    waitFor: [build-all]
+    args: ["run", "--timeout=10m", "./..."]
+
+  - id: govulncheck
+    name: golang:1.26
+    entrypoint: bash
+    waitFor: [build-all]
+    env:
+      - GOCACHE=/workspace/.gocache
+      - GOMODCACHE=/workspace/.gomodcache
+    args:
+      - -ec
+      - |
+        go install golang.org/x/vuln/cmd/govulncheck@latest
+        $(go env GOPATH)/bin/govulncheck ./...
+
+  # The manifests are as deployable as the code, so they are validated the
+  # same way. A kustomize build that fails in CI is far cheaper than one that
+  # fails halfway through a production rollout.
+  - id: validate-manifests
+    name: gcr.io/cloud-builders/kubectl
+    entrypoint: bash
+    args:
+      - -ec
+      - |
+        for env in dev staging prod; do
+          echo "=== $env ==="
+          # The render script, not kustomize directly: it also fails if any
+          # PROJECT_ID or ENV placeholder survives substitution, which is the
+          # failure that would otherwise only surface as pods unable to fetch
+          # their secrets after a successful-looking rollout.
+          ./scripts/render-manifests.sh "$env" > "/workspace/rendered-$env.yaml"
+          echo "  $(grep -c '^kind:' "/workspace/rendered-$env.yaml") resources"
+        done
+
+  - id: validate-terraform
+    name: hashicorp/terraform:1.13
+    entrypoint: sh
+    args:
+      - -ec
+      - |
+        cd deploy/terraform
+        terraform fmt -check -recursive
+        terraform init -backend=false -input=false
+        terraform validate
+
+  # The web client's MTProto implementation must stay byte-compatible with the
+  # Go server's. These tests assert the same vectors on both sides, so a
+  # divergence fails the build rather than silently breaking every browser.
+  - id: web
+    name: node:24-alpine
+    entrypoint: sh
+    args:
+      - -ec
+      - |
+        cd web
+        npm ci --no-audit --no-fund
+        npm run typecheck
+        npm test
+
+  # The Kotlin MTProto module is pure JVM, so it tests without an emulator.
+  # It asserts the same pinned vectors as the Go and TypeScript suites: three
+  # independent implementations of one specification will drift apart
+  # eventually, and this is what turns that into a build failure rather than
+  # an Android client that silently cannot decrypt anything.
+  - id: android
+    name: gradle:8.11-jdk21
+    entrypoint: bash
+    args:
+      - -ec
+      - |
+        cd android
+        gradle --no-daemon :mtproto:test
+
+  # Scan the manifests for insecure settings. This is where a forgotten
+  # privileged: true or a missing resource limit gets caught.
+  - id: scan-manifests
+    name: aquasec/trivy:latest
+    waitFor: [validate-manifests]
+    entrypoint: sh
+    args:
+      - -ec
+      - |
+        trivy config --severity HIGH,CRITICAL --exit-code 1 deploy/k8s/ || {
+          echo "manifest scan found HIGH or CRITICAL issues"
+          exit 1
+        }

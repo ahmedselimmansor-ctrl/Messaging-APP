@@ -1,0 +1,59 @@
+# Media processor: the one image that carries ffmpeg.
+#
+# It is separate from the distroless service image for a specific reason: this
+# is the only component that downloads and parses attacker-supplied files, and
+# ffmpeg is historically where that parsing goes wrong. Isolating it means the
+# large, CVE-prone dependency is present in exactly one workload rather than
+# in all nine.
+
+FROM golang:1.26-bookworm AS build
+
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+COPY . .
+
+ARG VERSION=dev
+ARG COMMIT=unknown
+
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build -trimpath \
+      -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT}" \
+      -o /out/service ./services/consumers/mediaproc
+
+# ---------------------------------------------------------------------------
+# Runtime
+# ---------------------------------------------------------------------------
+#
+# Debian slim rather than distroless, because ffmpeg needs a libc and a large
+# set of codec libraries. The hardening that distroless gives for free is
+# recreated explicitly: no shell for the service user, a non-root uid, and a
+# read-only root filesystem enforced by the pod spec.
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ffmpeg \
+      ca-certificates \
+ && rm -rf /var/lib/apt/lists/* \
+ # Remove the package manager itself: nothing in this image should ever
+ # install anything at runtime, and its absence removes an obvious tool for
+ # anyone who does get code execution.
+ && rm -f /usr/bin/apt /usr/bin/apt-get /usr/bin/dpkg
+
+# uid 65532 matches runAsUser in the manifests and the other service images.
+RUN groupadd -g 65532 nonroot \
+ && useradd -u 65532 -g 65532 -M -s /usr/sbin/nologin nonroot
+
+COPY --from=build --chown=65532:65532 /out/service /service
+
+USER 65532:65532
+
+# The working directory is an emptyDir with a size limit, mounted by the pod.
+ENV WORK_DIR=/work
+
+EXPOSE 9090
+
+ENTRYPOINT ["/service"]

@@ -1,0 +1,72 @@
+# Cloud Deploy: the promotion path from staging to production.
+#
+# Cloud Build proves an image is good; Cloud Deploy decides where it runs.
+# Keeping them separate means a rollback is "promote the previous release",
+# not "find the old commit and rebuild it" — which matters at 3am.
+
+apiVersion: deploy.cloud.google.com/v1
+kind: DeliveryPipeline
+metadata:
+  name: messaging-pipeline
+description: Messaging platform, staging then production
+serialPipeline:
+  stages:
+    - targetId: staging
+      profiles: [staging]
+      strategy:
+        # Straight replacement in staging. A canary here would only slow down
+        # the feedback loop the environment exists to provide.
+        standard:
+          verify: true
+
+    - targetId: prod
+      profiles: [prod]
+      strategy:
+        canary:
+          runtimeConfig:
+            kubernetes:
+              # Service mesh traffic splitting, which shifts a percentage of
+              # real requests rather than a percentage of pods. Pod-based
+              # canary approximates the split by replica count and is wrong
+              # whenever replicas are unevenly loaded.
+              serviceNetworking:
+                service: chat-service
+                deployment: chat-service
+                disablePodOverprovisioning: false
+          canaryDeployment:
+            # 10% first: enough traffic to surface an error rate, small enough
+            # that the blast radius is one user in ten for a few minutes.
+            percentages: [10, 25, 50]
+            verify: true
+            predeploy:
+              actions: [predeploy-migrate]
+            postdeploy:
+              actions: [postdeploy-verify]
+---
+apiVersion: deploy.cloud.google.com/v1
+kind: Target
+metadata:
+  name: staging
+description: Staging cluster
+gke:
+  cluster: projects/messaging-staging/locations/europe-west1/clusters/messaging-staging-cluster
+executionConfigs:
+  - usages: [RENDER, DEPLOY, VERIFY, PREDEPLOY, POSTDEPLOY]
+    serviceAccount: messaging-staging-clouddeploy@messaging-staging.iam.gserviceaccount.com
+    artifactStorage: gs://messaging-staging-clouddeploy
+---
+apiVersion: deploy.cloud.google.com/v1
+kind: Target
+metadata:
+  name: prod
+description: Production cluster
+# A human approves every production release. The gate is not about distrust
+# of the pipeline — it is that someone should be watching when a change
+# reaches real users, and be available to roll it back.
+requireApproval: true
+gke:
+  cluster: projects/messaging-prod/locations/europe-west1/clusters/messaging-prod-cluster
+executionConfigs:
+  - usages: [RENDER, DEPLOY, VERIFY, PREDEPLOY, POSTDEPLOY]
+    serviceAccount: messaging-prod-clouddeploy@messaging-prod.iam.gserviceaccount.com
+    artifactStorage: gs://messaging-prod-clouddeploy

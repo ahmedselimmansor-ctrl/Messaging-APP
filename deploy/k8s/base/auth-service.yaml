@@ -1,0 +1,164 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auth-service
+  namespace: messaging
+  labels: { app: auth-service, tier: api }
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels: { app: auth-service }
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }
+  template:
+    metadata:
+      labels: { app: auth-service, tier: api }
+      annotations:
+        proxy.istio.io/config: |
+          holdApplicationUntilProxyStarts: true
+    spec:
+      serviceAccountName: auth-service
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: { app: auth-service }
+      nodeSelector: { workload: stateless }
+      initContainers:
+        - name: cloudsql-proxy
+          image: gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.14.1
+          restartPolicy: Always
+          args: ["--structured-logs", "--auto-iam-authn", "--private-ip",
+                 "--health-check", "--http-address=0.0.0.0", "--http-port=9801",
+                 "--max-sigterm-delay=30s", "$(CLOUDSQL_CONNECTION_NAME)"]
+          env:
+            - name: CLOUDSQL_CONNECTION_NAME
+              valueFrom: { configMapKeyRef: { name: platform-config, key: CLOUDSQL_CONNECTION_NAME } }
+          ports: [{ containerPort: 5432, name: postgres }]
+          startupProbe:
+            httpGet: { path: /startup, port: 9801 }
+            periodSeconds: 1
+            failureThreshold: 60
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 256Mi }
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+      containers:
+        - name: auth-service
+          image: IMAGE_REPOSITORY/auth-service:latest
+          ports:
+            - { name: http, containerPort: 8080 }
+            - { name: admin, containerPort: 9090 }
+          envFrom:
+            - configMapRef: { name: platform-config }
+          env:
+            - { name: SERVICE_NAME, value: auth-service }
+            - name: HOSTNAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - { name: GOMEMLIMIT, value: "430MiB" }
+            # The signing key comes from Secret Manager, projected as a file
+            # by the CSI driver. It is the single most sensitive value in the
+            # platform — whoever holds it can mint a token for any account —
+            # so it is never put in the process environment, where it would be
+            # readable from /proc/<pid>/environ and inherited by every child.
+            - { name: JWT_SIGNING_KEY_PEM_FILE, value: /var/secrets/jwt-signing-key.pem }
+            # The key id is not a secret: it is published in the JWKS document
+            # so verifiers can select the right key. It must be changed in the
+            # same release that rotates the key above, or clients will use the
+            # new key's material against the old key's identifier.
+            - { name: JWT_SIGNING_KEY_ID, value: "k1" }
+            - { name: SMS_WEBHOOK_AUTH_FILE, value: /var/secrets/sms-webhook-auth }
+          startupProbe:
+            httpGet: { path: /readyz, port: admin }
+            periodSeconds: 2
+            failureThreshold: 45
+          readinessProbe:
+            httpGet: { path: /readyz, port: admin }
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: { path: /healthz, port: admin }
+            periodSeconds: 15
+            failureThreshold: 5
+          lifecycle:
+            preStop: { exec: { command: ["/bin/sleep", "5"] } }
+          resources:
+            requests: { cpu: 200m, memory: 256Mi }
+            limits: { memory: 512Mi }
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+            - { name: secrets, mountPath: /var/secrets, readOnly: true }
+      volumes:
+        - name: tmp
+          emptyDir: { sizeLimit: 64Mi }
+        - name: secrets
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes: { secretProviderClass: auth-secrets }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: auth-service
+  namespace: messaging
+  labels: { app: auth-service }
+  annotations:
+    cloud.google.com/neg: '{"exposed_ports": {"80":{"name":"auth-service-http"}}}'
+spec:
+  selector: { app: auth-service }
+  ports:
+    - { name: http, port: 80, targetPort: http }
+    - { name: admin, port: 9090, targetPort: admin }
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: { name: auth-service, namespace: messaging }
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: auth-service }
+  minReplicas: 2
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: { type: Utilization, averageUtilization: 70 }
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: { name: auth-service, namespace: messaging }
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: { app: auth-service }
+---
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata: { name: auth-service, namespace: messaging }
+spec:
+  selector:
+    matchLabels: { app: auth-service }
+  endpoints:
+    - { port: admin, path: /metrics, interval: 30s }

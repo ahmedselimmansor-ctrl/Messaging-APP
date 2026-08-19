@@ -1,0 +1,177 @@
+# NetworkPolicy: default deny, then explicit allows.
+#
+# The mesh's mTLS proves *who* is calling; NetworkPolicy decides *whether the
+# packet arrives at all*. Both matter: a mesh policy is enforced by a sidecar
+# the workload could in principle bypass, while these rules are enforced by
+# the dataplane (Cilium/eBPF on this cluster) below the pod.
+#
+# The rule that earns its keep is the last one: the realtime gateway cannot
+# reach Postgres or Cassandra at all. It is the tier most exposed to the
+# internet and it holds no business logic, so a compromise there should not be
+# a path to the data.
+
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: messaging
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+# DNS is required by everything and blocking it produces failures that look
+# like anything but a network policy.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+  namespace: messaging
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+---
+# Probes and metric scrapes originate outside the namespace.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-observability
+  namespace: messaging
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: gmp-system
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+        # Google's health-check prober ranges, which reach the pod directly
+        # through the load balancer's NEG.
+        - ipBlock: { cidr: 35.191.0.0/16 }
+        - ipBlock: { cidr: 130.211.0.0/22 }
+      ports:
+        - { protocol: TCP, port: 9090 }
+---
+# Every service may reach Google APIs, Kafka, Redis and Cloud SQL. These are
+# all outside the cluster, so the rule is expressed as "anything except the
+# cluster's own ranges", which keeps it correct when a managed service's
+# address changes.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-managed-services-egress
+  namespace: messaging
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              # Deny the link-local range so a pod cannot reach the node's
+              # metadata server directly. GKE_METADATA already blocks the
+              # dangerous parts of it; this closes the rest.
+              - 169.254.169.254/32
+      ports:
+        - { protocol: TCP, port: 443 }   # Google APIs, FCM, SMS webhook
+        - { protocol: TCP, port: 9092 }  # Kafka
+        - { protocol: TCP, port: 6379 }  # Redis
+        - { protocol: TCP, port: 5432 }  # Cloud SQL through the proxy
+        - { protocol: TCP, port: 9200 }  # Elasticsearch
+        - { protocol: TCP, port: 4317 }  # OTLP collector
+---
+# Traffic between services in the namespace.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-intra-namespace
+  namespace: messaging
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector: {}
+      ports:
+        - { protocol: TCP, port: 8080 }
+  egress:
+    - to:
+        - podSelector: {}
+      ports:
+        - { protocol: TCP, port: 8080 }
+        - { protocol: TCP, port: 9090 }
+---
+# Public ingress to the gateway. The MTProto ports are reached on the node's
+# address through the passthrough load balancer, so the source is the whole
+# internet and cannot be narrowed.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-realtime-ingress
+  namespace: messaging
+spec:
+  podSelector:
+    matchLabels: { app: realtime-gateway }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - ipBlock: { cidr: 0.0.0.0/0 }
+      ports:
+        - { protocol: TCP, port: 4443 }
+        - { protocol: UDP, port: 4443 }
+        - { protocol: TCP, port: 8080 }
+---
+# Only the chat service and the persister may reach Cassandra.
+#
+# The gateway is conspicuously absent, and that is the point.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-cassandra-clients
+  namespace: data
+spec:
+  podSelector:
+    matchLabels: { app: cassandra }
+  policyTypes: [Ingress]
+  ingress:
+    # Ring traffic between Cassandra nodes: gossip, streaming and the
+    # inter-node messaging port.
+    - from:
+        - podSelector:
+            matchLabels: { app: cassandra }
+      ports:
+        - { protocol: TCP, port: 7000 }  # inter-node
+        - { protocol: TCP, port: 7001 }  # inter-node TLS
+        - { protocol: TCP, port: 7199 }  # JMX
+    # CQL, from the two services that are allowed to speak it.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: messaging
+          podSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values: [chat-service, persister]
+      ports:
+        - { protocol: TCP, port: 9042 }
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: gmp-system
+      ports:
+        - { protocol: TCP, port: 9103 }  # the metrics exporter sidecar

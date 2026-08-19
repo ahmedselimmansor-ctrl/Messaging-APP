@@ -1,0 +1,26 @@
+{
+  "name": "messaging-web",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Web client for the messaging platform. Speaks MTProto over WebSocket.",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "typecheck": "tsc --noEmit",
+    "lint": "next lint",
+    "test": "tsc lib/mtproto/crypto.ts --outDir .test-build --target ES2022 --module esnext --moduleResolution bundler --lib ES2022,DOM --skipLibCheck && node --test lib/mtproto/crypto.test.mjs",
+    "pretest": "rm -rf .test-build"
+  },
+  "dependencies": {
+    "next": "^15.1.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "typescript": "^5.7.0"
+  }
+}

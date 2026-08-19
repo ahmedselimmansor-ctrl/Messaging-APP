@@ -1,0 +1,320 @@
+# Cassandra on GKE.
+#
+# This is the one component with no managed GCP equivalent, so we own its
+# operations entirely: repair, backup, upgrades, capacity. That is a real
+# ongoing cost, and DataStax Astra DB is a legitimate alternative that trades
+# money for that burden — see docs/ARCHITECTURE.md for the comparison. What
+# follows is the self-managed path done properly.
+#
+# The settings that matter most, and why:
+#
+#   * Anti-affinity is required, not preferred. Two replicas of the same data
+#     on one node means a node failure can lose a quorum.
+#   * The rack label is the GCP zone, so Cassandra's replica placement
+#     understands the failure domain and RF=3 genuinely means three zones.
+#   * Heap is capped at 8G with G1. Larger heaps mean longer GC pauses, and a
+#     pause over the failure detector's threshold marks the node down — which
+#     is worse than the memory pressure it was meant to relieve.
+#   * The preStop hook drains before termination. Killing a node without
+#     draining leaves hints to replay and can drop in-flight writes.
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: cassandra
+  namespace: data
+  labels:
+    app: cassandra
+spec:
+  # Headless: clients resolve every pod address and the driver builds its own
+  # topology map. A load-balanced Service would defeat token-aware routing and
+  # add a hop to every query.
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: cassandra
+  ports:
+    - { name: intra-node, port: 7000 }
+    - { name: tls-intra-node, port: 7001 }
+    - { name: jmx, port: 7199 }
+    - { name: cql, port: 9042 }
+    - { name: metrics, port: 9103 }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: cassandra
+  namespace: data
+  labels:
+    app: cassandra
+spec:
+  serviceName: cassandra
+  replicas: 6
+  # OrderedReady, not Parallel. Cassandra nodes must join the ring one at a
+  # time: two simultaneous bootstraps can claim overlapping token ranges and
+  # produce a ring that needs manual repair.
+  podManagementPolicy: OrderedReady
+
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      partition: 0
+
+  selector:
+    matchLabels:
+      app: cassandra
+
+  template:
+    metadata:
+      labels:
+        app: cassandra
+      annotations:
+        # Cassandra's inter-node protocol is not HTTP and the driver's
+        # token-aware routing needs the real pod addresses, so the mesh
+        # sidecar is excluded entirely here.
+        sidecar.istio.io/inject: "false"
+    spec:
+      serviceAccountName: cassandra
+
+      # Ten minutes. A drain streams this node's hints and pending writes to
+      # its replicas; cutting it short is how data goes missing.
+      terminationGracePeriodSeconds: 600
+
+      nodeSelector:
+        workload: stateful
+      tolerations:
+        - key: workload
+          operator: Equal
+          value: stateful
+          effect: NoSchedule
+
+      affinity:
+        podAntiAffinity:
+          # required, not preferred. This is the constraint that makes RF=3
+          # meaningful.
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app
+                    operator: In
+                    values: [cassandra]
+              topologyKey: kubernetes.io/hostname
+          # Prefer a spread across zones as well, so the six nodes land two
+          # per zone rather than clustering.
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values: [cassandra]
+                topologyKey: topology.kubernetes.io/zone
+
+      securityContext:
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+
+      initContainers:
+        # Cassandra will not start if it cannot write its data directory, and
+        # a PVC created by the CSI driver is root-owned.
+        - name: fix-permissions
+          image: busybox:1.36
+          command: ["sh", "-c", "chown -R 999:999 /var/lib/cassandra"]
+          volumeMounts:
+            - { name: cassandra-data, mountPath: /var/lib/cassandra }
+          securityContext:
+            runAsUser: 0
+            capabilities:
+              add: ["CHOWN"]
+              drop: ["ALL"]
+
+      containers:
+        - name: cassandra
+          image: cassandra:5.0
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - { name: intra-node, containerPort: 7000 }
+            - { name: tls-intra-node, containerPort: 7001 }
+            - { name: jmx, containerPort: 7199 }
+            - { name: cql, containerPort: 9042 }
+
+          env:
+            - name: CASSANDRA_SEEDS
+              # Two seeds, not all six. Seeds are only used for bootstrap
+              # gossip; listing every node makes a rolling restart of the
+              # seeds themselves disruptive.
+              value: "cassandra-0.cassandra.data.svc.cluster.local,cassandra-1.cassandra.data.svc.cluster.local"
+            - name: CASSANDRA_CLUSTER_NAME
+              value: "messaging"
+            - name: CASSANDRA_DC
+              value: "europe-west1"
+            # The rack is the GCP zone, read from the node. This is what makes
+            # NetworkTopologyStrategy place the three replicas in three zones
+            # rather than three racks it invented.
+            - name: CASSANDRA_RACK
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.annotations['topology.kubernetes.io/zone']
+            - name: CASSANDRA_ENDPOINT_SNITCH
+              value: "GossipingPropertyFileSnitch"
+            - name: CASSANDRA_NUM_TOKENS
+              # 16 vnodes rather than the old default of 256: fewer tokens
+              # means faster repair and streaming, at a small cost in
+              # distribution evenness. 16 is the modern recommendation.
+              value: "16"
+            - name: CASSANDRA_LISTEN_ADDRESS
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: CASSANDRA_BROADCAST_ADDRESS
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: CASSANDRA_RPC_ADDRESS
+              value: "0.0.0.0"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: MAX_HEAP_SIZE
+              # 8G is the practical ceiling for G1 before pause times start
+              # tripping the failure detector. The rest of the node's 64GB is
+              # page cache, which is where Cassandra actually wants it.
+              value: "8G"
+            - name: HEAP_NEWSIZE
+              value: "2G"
+            - name: JVM_OPTS
+              value: >-
+                -XX:+UseG1GC
+                -XX:MaxGCPauseMillis=300
+                -XX:InitiatingHeapOccupancyPercent=70
+                -XX:+ParallelRefProcEnabled
+                -XX:+AlwaysPreTouch
+                -XX:+UseTLAB
+                -XX:+PerfDisableSharedMem
+                -Djava.rmi.server.hostname=$(POD_NAME).cassandra.data.svc.cluster.local
+                -Dcassandra.consistent.rangemovement=false
+
+          resources:
+            requests:
+              cpu: "4"
+              memory: 24Gi
+            limits:
+              # No CPU limit: throttling a Cassandra node mid-compaction
+              # cascades into read latency across the ring.
+              memory: 32Gi
+
+          # Readiness is `nodetool status` reporting this node as Up/Normal.
+          # Anything weaker would put a bootstrapping node into the Service
+          # and hand clients a node that cannot answer.
+          readinessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -ec
+                - |
+                  nodetool status 2>/dev/null | grep -E "^UN\\s+${POD_IP}" || exit 1
+            initialDelaySeconds: 90
+            periodSeconds: 15
+            timeoutSeconds: 10
+            failureThreshold: 4
+
+          livenessProbe:
+            exec:
+              command: ["/bin/bash", "-ec", "nodetool version"]
+            initialDelaySeconds: 120
+            periodSeconds: 30
+            timeoutSeconds: 15
+            failureThreshold: 5
+
+          # Startup can take minutes on a node replaying a large commit log.
+          startupProbe:
+            exec:
+              command: ["/bin/bash", "-ec", "nodetool version"]
+            periodSeconds: 15
+            failureThreshold: 40 # up to ten minutes
+
+          lifecycle:
+            preStop:
+              exec:
+                # `nodetool drain` flushes memtables and stops accepting
+                # writes. Skipping it means the replacement pod replays a
+                # commit log and the ring carries hints for this node.
+                command: ["/bin/bash", "-ec", "nodetool drain"]
+
+          volumeMounts:
+            - { name: cassandra-data, mountPath: /var/lib/cassandra }
+            - { name: cassandra-config, mountPath: /etc/cassandra/cassandra.yaml.d }
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              # Cassandra locks its heap into memory to avoid being swapped.
+              add: ["IPC_LOCK"]
+
+        # Prometheus exporter, so the ring's health is visible in the same
+        # place as everything else.
+        - name: metrics-exporter
+          image: criteord/cassandra_exporter:2.3.8
+          ports:
+            - { name: metrics, containerPort: 9103 }
+          env:
+            - { name: CASSANDRA_EXPORTER_CONFIG_listenPort, value: "9103" }
+            - { name: JVM_OPTS, value: "-Xmx128m -Xms128m" }
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { memory: 256Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+
+      volumes:
+        - name: cassandra-config
+          configMap:
+            name: cassandra-config
+            optional: true
+
+  volumeClaimTemplates:
+    - metadata:
+        name: cassandra-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        # premium-rwo is GCP's SSD persistent disk. Standard disks cannot
+        # sustain Cassandra's compaction IO and the symptom is unexplained
+        # read latency.
+        storageClassName: premium-rwo
+        resources:
+          requests:
+            storage: 500Gi
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: cassandra
+  namespace: data
+spec:
+  # Exactly one node down at a time. With RF=3 and LOCAL_QUORUM, two
+  # simultaneous losses in the same replica set fails writes.
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: cassandra
+---
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: cassandra
+  namespace: data
+spec:
+  selector:
+    matchLabels:
+      app: cassandra
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s

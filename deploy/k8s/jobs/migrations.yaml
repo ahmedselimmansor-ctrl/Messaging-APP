@@ -1,0 +1,192 @@
+# Schema migration Jobs.
+#
+# These run before a new service version rolls out (Cloud Deploy's predeploy
+# hook), which is why every migration must be backward compatible: during the
+# rollout, the old and new binaries are both live against the new schema.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: db-migrate
+  namespace: messaging
+  annotations:
+    # Let Cloud Deploy replace the Job on each release rather than failing on
+    # an immutable-field conflict.
+    argocd.argoproj.io/hook: PreSync
+spec:
+  # Six attempts, then stop and alert. A migration that fails six times will
+  # not succeed on the seventh, and retrying forever hides the failure.
+  backoffLimit: 6
+  # Clean up an hour after completion so the namespace does not accumulate a
+  # Job per deploy.
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      annotations:
+        sidecar.istio.io/inject: "false"
+    spec:
+      restartPolicy: Never
+      serviceAccountName: chat-service
+      nodeSelector: { workload: stateless }
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile: { type: RuntimeDefault }
+      initContainers:
+        - name: cloudsql-proxy
+          image: gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.14.1
+          restartPolicy: Always
+          args: ["--structured-logs", "--auto-iam-authn", "--private-ip",
+                 "--health-check", "--http-address=0.0.0.0", "--http-port=9801",
+                 "$(CLOUDSQL_CONNECTION_NAME)"]
+          env:
+            - name: CLOUDSQL_CONNECTION_NAME
+              valueFrom: { configMapKeyRef: { name: platform-config, key: CLOUDSQL_CONNECTION_NAME } }
+          startupProbe:
+            httpGet: { path: /startup, port: 9801 }
+            periodSeconds: 1
+            failureThreshold: 60
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+      containers:
+        - name: migrate
+          image: IMAGE_REPOSITORY/migrate:latest
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              echo "applying postgres migrations"
+              for f in /migrations/*.sql; do
+                echo "  $f"
+                psql "$POSTGRES_DSN" -v ON_ERROR_STOP=1 -f "$f"
+              done
+              echo "done"
+          env:
+            - name: POSTGRES_DSN
+              valueFrom: { configMapKeyRef: { name: platform-config, key: POSTGRES_DSN } }
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { memory: 256Mi }
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: cassandra-schema
+  namespace: data
+spec:
+  backoffLimit: 6
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      annotations:
+        sidecar.istio.io/inject: "false"
+    spec:
+      restartPolicy: Never
+      # The only workload permitted to read the Cassandra superuser password.
+      # It runs once per deploy and then the identity is idle.
+      serviceAccountName: cassandra-admin
+      nodeSelector: { workload: stateless }
+      containers:
+        - name: cqlsh
+          image: cassandra:5.0
+          command: ["/bin/bash", "-ec"]
+          args:
+            - |
+              # Wait for the ring rather than failing fast: on a fresh cluster
+              # this Job may start before Cassandra has finished bootstrapping.
+              for i in $(seq 1 60); do
+                if cqlsh cassandra-0.cassandra.data.svc.cluster.local -e "describe cluster" >/dev/null 2>&1; then
+                  break
+                fi
+                echo "waiting for cassandra ($i/60)"
+                sleep 10
+              done
+              HOST=cassandra-0.cassandra.data.svc.cluster.local
+
+              # Authenticate as the superuser. Once roles.cql has run,
+              # authentication is enforced and an anonymous cqlsh cannot
+              # change the schema.
+              AUTH="-u cassandra -p $(cat /var/secrets/cassandra-superuser-password)"
+
+              cqlsh $HOST $AUTH -f /schema/schema.cql
+
+              # Roles carry passwords, so the file in the ConfigMap has
+              # placeholders rather than values — a ConfigMap is world-readable
+              # within the namespace and is exactly the wrong place for a
+              # credential. Substitute from the CSI-projected files into a
+              # file under /tmp, which is an in-memory emptyDir.
+              #
+              # sed with a pipe delimiter, because a base64 password can
+              # contain '/' but never '|'.
+              sed \
+                -e "s|:chat_password|$(cat /var/secrets/cassandra-chat-password)|" \
+                -e "s|:persister_password|$(cat /var/secrets/cassandra-persister-password)|" \
+                -e "s|:media_password|$(cat /var/secrets/cassandra-media-password)|" \
+                -e "s|:readonly_password|$(cat /var/secrets/cassandra-readonly-password)|" \
+                /schema/roles.cql > /tmp/roles.cql
+
+              cqlsh $HOST $AUTH -f /tmp/roles.cql
+              # Remove it immediately rather than relying on the pod ending.
+              shred -u /tmp/roles.cql 2>/dev/null || rm -f /tmp/roles.cql
+
+              echo "schema and roles applied"
+          volumeMounts:
+            - { name: schema, mountPath: /schema }
+            - { name: secrets, mountPath: /var/secrets, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { memory: 512Mi }
+      volumes:
+        - name: schema
+          configMap:
+            name: cassandra-schema
+        - name: tmp
+          emptyDir: { medium: Memory, sizeLimit: 8Mi }
+        - name: secrets
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes: { secretProviderClass: cassandra-admin-secrets }
+---
+# The schema Job's identity, in the data namespace where it runs.
+#
+# It is the only principal that can read the Cassandra superuser password, and
+# it exists only while a deploy is running. Nothing in the messaging namespace
+# can reach these secrets: application workloads get exactly one per-service
+# role each (deploy/terraform/main.tf).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cassandra-admin
+  namespace: data
+  annotations:
+    iam.gke.io/gcp-service-account: ENV-cassandra-admin@PROJECT_ID.iam.gserviceaccount.com
+automountServiceAccountToken: false
+---
+apiVersion: secrets-store.csi.x-k8s.io/v1
+kind: SecretProviderClass
+metadata:
+  name: cassandra-admin-secrets
+  namespace: data
+spec:
+  provider: gke
+  parameters:
+    secrets: |
+      - resourceName: "projects/PROJECT_ID/secrets/messaging-ENV-cassandra-superuser-credentials/versions/latest"
+        path: "cassandra-superuser-password"
+      - resourceName: "projects/PROJECT_ID/secrets/messaging-ENV-cassandra-chat-credentials/versions/latest"
+        path: "cassandra-chat-password"
+      - resourceName: "projects/PROJECT_ID/secrets/messaging-ENV-cassandra-persister-credentials/versions/latest"
+        path: "cassandra-persister-password"
+      - resourceName: "projects/PROJECT_ID/secrets/messaging-ENV-cassandra-media-credentials/versions/latest"
+        path: "cassandra-media-password"
+      - resourceName: "projects/PROJECT_ID/secrets/messaging-ENV-cassandra-readonly-credentials/versions/latest"
+        path: "cassandra-readonly-password"

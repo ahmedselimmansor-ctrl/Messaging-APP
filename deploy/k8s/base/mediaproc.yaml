@@ -1,0 +1,179 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mediaproc
+  namespace: messaging
+  labels: { app: mediaproc, tier: consumer }
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels: { app: mediaproc }
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxSurge: 1, maxUnavailable: 1 }
+  template:
+    metadata:
+      labels: { app: mediaproc, tier: consumer }
+      annotations:
+        proxy.istio.io/config: |
+          holdApplicationUntilProxyStarts: true
+    spec:
+      serviceAccountName: mediaproc
+      # A transcode in flight should finish rather than be restarted from
+      # scratch: it has already spent minutes of CPU.
+      terminationGracePeriodSeconds: 300
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      nodeSelector: { workload: stateless }
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: { app: mediaproc }
+      containers:
+        - name: mediaproc
+          image: IMAGE_REPOSITORY/mediaproc:latest
+          ports:
+            - { name: admin, containerPort: 9090 }
+          envFrom:
+            - configMapRef: { name: platform-config }
+          env:
+            - { name: SERVICE_NAME, value: mediaproc }
+            - name: HOSTNAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - { name: GOMEMLIMIT, value: "1700MiB" }
+            - { name: SCANNER_PROVIDER, value: clamav }
+            - { name: CLAMAV_ADDR, value: "127.0.0.1:3310" }
+            - { name: WORK_DIR, value: /work }
+          startupProbe:
+            httpGet: { path: /readyz, port: admin }
+            periodSeconds: 3
+            # ClamAV loads its signature database at startup, which takes
+            # around a minute and is why this is generous.
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: { path: /readyz, port: admin }
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: { path: /healthz, port: admin }
+            periodSeconds: 30
+            failureThreshold: 5
+          resources:
+            requests:
+              # Transcoding is CPU-bound; this is the one consumer where CPU
+              # is the binding constraint rather than IO.
+              cpu: "2"
+              memory: 1Gi
+            limits:
+              memory: 2Gi
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: work, mountPath: /work }
+            - { name: tmp, mountPath: /tmp }
+
+        # ClamAV as a sidecar rather than a shared service: the object bytes
+        # never leave the pod, so a scan is a loopback write instead of a
+        # network transfer of every uploaded file.
+        - name: clamav
+          image: clamav/clamav:1.4
+          ports:
+            - { name: clamd, containerPort: 3310 }
+          env:
+            - { name: CLAMAV_NO_MILTERD, value: "true" }
+            # freshclam updates signatures in-container. Without it the
+            # database ages and the scanner quietly stops catching anything new.
+            - { name: FRESHCLAM_CHECKS, value: "12" }
+          resources:
+            requests:
+              cpu: 200m
+              # ClamAV holds its entire signature database in memory; ~2GB is
+              # the realistic floor and it will OOM below it.
+              memory: 2Gi
+            limits:
+              memory: 3Gi
+          startupProbe:
+            exec:
+              command: ["/bin/sh", "-c", "echo PING | nc -w 5 localhost 3310 | grep -q PONG"]
+            periodSeconds: 10
+            failureThreshold: 30
+          livenessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "echo PING | nc -w 5 localhost 3310 | grep -q PONG"]
+            periodSeconds: 60
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: clamav-db, mountPath: /var/lib/clamav }
+
+      volumes:
+        - name: work
+          emptyDir:
+            # A bounded volume, so a runaway transcode fills this rather than
+            # the node's disk.
+            sizeLimit: 8Gi
+        - name: tmp
+          emptyDir: { sizeLimit: 256Mi }
+        - name: clamav-db
+          emptyDir: { sizeLimit: 4Gi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mediaproc
+  namespace: messaging
+  labels: { app: mediaproc }
+spec:
+  clusterIP: None
+  selector: { app: mediaproc }
+  ports:
+    - { name: admin, port: 9090, targetPort: admin }
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: { name: mediaproc, namespace: messaging }
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: mediaproc }
+  minReplicas: 2
+  maxReplicas: 12
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: { type: Utilization, averageUtilization: 80 }
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 120
+    scaleDown:
+      # Slow: each pod carries a ~2GB ClamAV database that takes a minute to
+      # load, so churning replicas is expensive.
+      stabilizationWindowSeconds: 900
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: { name: mediaproc, namespace: messaging }
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels: { app: mediaproc }
+---
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata: { name: mediaproc, namespace: messaging }
+spec:
+  selector:
+    matchLabels: { app: mediaproc }
+  endpoints:
+    - { port: admin, path: /metrics, interval: 30s }

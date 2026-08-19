@@ -1,0 +1,133 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: media-service
+  namespace: messaging
+  labels: { app: media-service, tier: api }
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels: { app: media-service }
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }
+  template:
+    metadata:
+      labels: { app: media-service, tier: api }
+      annotations:
+        proxy.istio.io/config: |
+          holdApplicationUntilProxyStarts: true
+    spec:
+      serviceAccountName: media-service
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: { app: media-service }
+      nodeSelector: { workload: stateless }
+      containers:
+        - name: media-service
+          image: IMAGE_REPOSITORY/media-service:latest
+          ports:
+            - { name: http, containerPort: 8080 }
+            - { name: admin, containerPort: 9090 }
+          envFrom:
+            - configMapRef: { name: platform-config }
+          env:
+            - { name: SERVICE_NAME, value: media-service }
+            - name: HOSTNAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - { name: GOMEMLIMIT, value: "430MiB" }
+            # svc_media may SELECT media_acl and nothing else, so a compromise
+            # of this internet-facing service cannot read message bodies.
+            - { name: CASSANDRA_USERNAME, value: "svc_media" }
+            - { name: CASSANDRA_PASSWORD_FILE, value: /var/secrets/cassandra-password }
+          startupProbe:
+            httpGet: { path: /readyz, port: admin }
+            periodSeconds: 2
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: { path: /readyz, port: admin }
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: { path: /healthz, port: admin }
+            periodSeconds: 15
+            failureThreshold: 5
+          lifecycle:
+            preStop: { exec: { command: ["/bin/sleep", "5"] } }
+          resources:
+            requests: { cpu: 200m, memory: 256Mi }
+            limits: { memory: 512Mi }
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+            - { name: secrets, mountPath: /var/secrets, readOnly: true }
+      volumes:
+        - name: tmp
+          emptyDir: { sizeLimit: 64Mi }
+        - name: secrets
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes: { secretProviderClass: media-secrets }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: media-service
+  namespace: messaging
+  labels: { app: media-service }
+spec:
+  selector: { app: media-service }
+  ports:
+    - { name: http, port: 80, targetPort: http }
+    - { name: admin, port: 9090, targetPort: admin }
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: { name: media-service, namespace: messaging }
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: media-service }
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: { type: Utilization, averageUtilization: 70 }
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: { name: media-service, namespace: messaging }
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: { app: media-service }
+---
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata: { name: media-service, namespace: messaging }
+spec:
+  selector:
+    matchLabels: { app: media-service }
+  endpoints:
+    - { port: admin, path: /metrics, interval: 30s }

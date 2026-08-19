@@ -1,0 +1,76 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+
+resources:
+  - ../../base
+  - ../../cassandra
+  - ../../jobs
+
+# Placeholder substitution. `kustomize edit set image` handles the image tags;
+# these replacements handle the project and environment identifiers that
+# appear inside annotation and secret-path strings, which no kustomize
+# built-in transformer reaches.
+patches:
+  - path: replicas.yaml
+    target:
+      kind: Deployment
+
+images:
+  - name: IMAGE_REPOSITORY/auth-service
+    newName: europe-west1-docker.pkg.dev/messaging-dev/messaging-app/auth-service
+  - name: IMAGE_REPOSITORY/chat-service
+    newName: europe-west1-docker.pkg.dev/messaging-dev/messaging-app/chat-service
+  - name: IMAGE_REPOSITORY/realtime-gateway
+    newName: europe-west1-docker.pkg.dev/messaging-dev/messaging-app/realtime-gateway
+  - name: IMAGE_REPOSITORY/presence-service
+    newName: europe-west1-docker.pkg.dev/messaging-dev/messaging-app/presence-service
+  - name: IMAGE_REPOSITORY/media-service
+    newName: europe-west1-docker.pkg.dev/messaging-dev/messaging-app/media-service
+  - name: IMAGE_REPOSITORY/notification-service
+    newName: europe-west1-docker.pkg.dev/messaging-dev/messaging-app/notification-service
+  - name: IMAGE_REPOSITORY/persister
+    newName: europe-west1-docker.pkg.dev/messaging-dev/messaging-app/persister
+  - name: IMAGE_REPOSITORY/pusher
+    newName: europe-west1-docker.pkg.dev/messaging-dev/messaging-app/pusher
+  - name: IMAGE_REPOSITORY/indexer
+    newName: europe-west1-docker.pkg.dev/messaging-dev/messaging-app/indexer
+  - name: IMAGE_REPOSITORY/mediaproc
+    newName: europe-west1-docker.pkg.dev/messaging-dev/messaging-app/mediaproc
+  - name: IMAGE_REPOSITORY/auditor
+    newName: europe-west1-docker.pkg.dev/messaging-dev/messaging-app/auditor
+  - name: IMAGE_REPOSITORY/search-service
+    newName: europe-west1-docker.pkg.dev/messaging-dev/messaging-app/search-service
+  - name: IMAGE_REPOSITORY/call-service
+    newName: europe-west1-docker.pkg.dev/messaging-dev/messaging-app/call-service
+  - name: IMAGE_REPOSITORY/admin-service
+    newName: europe-west1-docker.pkg.dev/messaging-dev/messaging-app/admin-service
+  - name: IMAGE_REPOSITORY/migrate
+    newName: europe-west1-docker.pkg.dev/messaging-dev/messaging-app/migrate
+
+configMapGenerator:
+  - name: platform-config
+    namespace: messaging
+    behavior: merge
+    literals:
+      - ENV=dev
+      - SMS_PROVIDER=log
+      - LOG_PRETTY=true
+      - GCP_PROJECT_ID=messaging-dev
+      - LOG_LEVEL=debug
+      - TRACE_SAMPLE_RATIO=1.0
+      - FCM_DRY_RUN=true
+      # Values below are rendered from `terraform output -json workload_env`
+      # by scripts/render-env.sh, so the manifests cannot drift from the
+      # infrastructure that Terraform actually created.
+
+generatorOptions:
+  # A hash suffix would make every ConfigMap change roll every Deployment,
+  # which is usually desirable — but here the ConfigMap is rendered from
+  # Terraform output and changes on unrelated infrastructure edits.
+  disableNameSuffixHash: true
+
+labels:
+  - pairs:
+      environment: dev
+    includeSelectors: false

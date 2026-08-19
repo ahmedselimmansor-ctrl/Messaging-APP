@@ -1,0 +1,92 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auditor
+  namespace: messaging
+  labels: { app: auditor, tier: consumer }
+spec:
+  # Exactly one. The audit topic has a single partition on purpose — one
+  # reader sees every entry in write order, which is what chain verification
+  # needs — so a second replica would sit idle in the consumer group anyway.
+  replicas: 1
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels: { app: auditor }
+  strategy:
+    # Recreate, not RollingUpdate. Two auditors briefly overlapping would
+    # rebalance the single partition and re-verify from a different offset,
+    # producing chain-break warnings that are artefacts of the deploy.
+    type: Recreate
+  template:
+    metadata:
+      labels: { app: auditor, tier: consumer }
+      annotations:
+        proxy.istio.io/config: |
+          holdApplicationUntilProxyStarts: true
+    spec:
+      serviceAccountName: auditor
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      nodeSelector: { workload: stateless }
+      containers:
+        - name: auditor
+          image: IMAGE_REPOSITORY/auditor:latest
+          ports:
+            - { name: admin, containerPort: 9090 }
+          envFrom:
+            - configMapRef: { name: platform-config }
+          env:
+            - { name: SERVICE_NAME, value: auditor }
+            - name: HOSTNAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - { name: GOMEMLIMIT, value: "430MiB" }
+          startupProbe:
+            httpGet: { path: /readyz, port: admin }
+            periodSeconds: 2
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: { path: /readyz, port: admin }
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: { path: /healthz, port: admin }
+            periodSeconds: 15
+            failureThreshold: 5
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { memory: 512Mi }
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: tmp
+          emptyDir: { sizeLimit: 64Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: auditor
+  namespace: messaging
+  labels: { app: auditor }
+spec:
+  selector: { app: auditor }
+  ports:
+    - { name: admin, port: 9090, targetPort: admin }
+---
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata: { name: auditor, namespace: messaging }
+spec:
+  selector:
+    matchLabels: { app: auditor }
+  endpoints:
+    - { port: admin, path: /metrics, interval: 30s }

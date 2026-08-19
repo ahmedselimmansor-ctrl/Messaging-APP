@@ -1,0 +1,332 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chat-service
+  namespace: messaging
+  labels:
+    app: chat-service
+    tier: api
+spec:
+  replicas: 3
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app: chat-service
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Surge one, never go below full capacity. This service is on the
+      # message send path; a moment of reduced capacity during a deploy is a
+      # moment of elevated latency for everyone sending.
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: chat-service
+        tier: api
+      annotations:
+        # The Cloud SQL Auth Proxy runs as a sidecar. Marking it a native
+        # sidecar (initContainer with restartPolicy: Always, below) means it
+        # starts before the app and stops after it — without that ordering the
+        # app's first database call races the proxy's startup.
+        proxy.istio.io/config: |
+          holdApplicationUntilProxyStarts: true
+    spec:
+      serviceAccountName: chat-service
+      # A deploy takes ~40s to drain: readiness fails, then in-flight requests
+      # finish. terminationGracePeriodSeconds must exceed the app's
+      # SHUTDOWN_GRACE or the kubelet SIGKILLs mid-drain.
+      terminationGracePeriodSeconds: 60
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+
+      # Spread replicas across zones. Without this the scheduler is free to
+      # put all three on one node, and a single node failure takes the whole
+      # service down.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: chat-service
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: chat-service
+
+      nodeSelector:
+        workload: stateless
+
+      initContainers:
+        # Native sidecar: restartPolicy Always on an initContainer keeps it
+        # running for the pod's lifetime while preserving init ordering.
+        - name: cloudsql-proxy
+          image: gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.14.1
+          restartPolicy: Always
+          args:
+            - "--structured-logs"
+            - "--auto-iam-authn"
+            - "--private-ip"
+            - "--health-check"
+            - "--http-address=0.0.0.0"
+            - "--http-port=9801"
+            # Exit cleanly when the app has finished, not the instant SIGTERM
+            # arrives, or in-flight queries are severed.
+            - "--max-sigterm-delay=30s"
+            - "$(CLOUDSQL_CONNECTION_NAME)"
+          env:
+            - name: CLOUDSQL_CONNECTION_NAME
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-config
+                  key: CLOUDSQL_CONNECTION_NAME
+          ports:
+            - containerPort: 5432
+              name: postgres
+          startupProbe:
+            httpGet:
+              path: /startup
+              port: 9801
+            periodSeconds: 1
+            failureThreshold: 60
+          livenessProbe:
+            httpGet:
+              path: /liveness
+              port: 9801
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+      containers:
+        - name: chat-service
+          image: IMAGE_REPOSITORY/chat-service:latest
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: admin
+              containerPort: 9090
+
+          envFrom:
+            - configMapRef:
+                name: platform-config
+          env:
+            - name: SERVICE_NAME
+              value: chat-service
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: VERSION
+              value: latest
+            # svc_chat reads history and writes edits and soft deletes. It
+            # cannot insert a new message: that grant belongs to the persister
+            # alone, downstream of Kafka.
+            - name: CASSANDRA_USERNAME
+              value: svc_chat
+            - name: CASSANDRA_PASSWORD_FILE
+              value: /var/secrets/cassandra-password
+            # GOMEMLIMIT is what stops a Go service being OOM-killed under
+            # load: the GC treats it as a soft ceiling and collects harder as
+            # it approaches, instead of growing past the container limit.
+            # Set to ~85% of the memory limit.
+            - name: GOMEMLIMIT
+              value: "870MiB"
+            - name: GOMAXPROCS
+              valueFrom:
+                resourceFieldRef:
+                  resource: limits.cpu
+
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: admin
+            periodSeconds: 2
+            # 60 × 2s = two minutes to establish connections to Postgres,
+            # Cassandra, Redis and Kafka. Generous, because failing startup
+            # here means CrashLoopBackOff and a much slower recovery.
+            failureThreshold: 60
+
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: admin
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+            periodSeconds: 15
+            timeoutSeconds: 3
+            # Liveness deliberately checks only that the process responds. A
+            # liveness probe that consulted Cassandra would restart every pod
+            # in the fleet during a database blip and turn a degradation into
+            # an outage.
+            failureThreshold: 5
+
+          lifecycle:
+            preStop:
+              exec:
+                # Sleep before SIGTERM so the endpoints controller and every
+                # node's kube-proxy have removed this pod from the Service.
+                # Without it, connections are still being routed here when the
+                # process starts shutting down.
+                command: ["/bin/sleep", "5"]
+
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              # No CPU limit, on purpose. A CPU limit throttles at the quota
+              # boundary even when the node is idle, which shows up as latency
+              # spikes exactly under load. Requests give the scheduler what it
+              # needs; the node's capacity is the real ceiling.
+              memory: 1Gi
+
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: secrets
+              mountPath: /var/secrets
+              readOnly: true
+
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+        - name: secrets
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: chat-secrets
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: chat-service
+  namespace: messaging
+  labels:
+    app: chat-service
+spec:
+  selector:
+    app: chat-service
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+    - name: admin
+      port: 9090
+      targetPort: admin
+  type: ClusterIP
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: chat-service
+  namespace: messaging
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: chat-service
+  minReplicas: 3
+  maxReplicas: 50
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          # 65%, not 80%: this service is latency-sensitive and Go's GC
+          # latency rises sharply as CPU saturates, so the headroom buys
+          # predictable p99 rather than wasted capacity.
+          averageUtilization: 65
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 75
+  behavior:
+    scaleUp:
+      # React quickly: a message backlog builds in seconds.
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+        - type: Pods
+          value: 4
+          periodSeconds: 30
+      selectPolicy: Max
+    scaleDown:
+      # Scale down slowly. Chat traffic is spiky and thrashing replicas costs
+      # more in cold-start latency than the nodes cost in money.
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 10
+          periodSeconds: 60
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: chat-service
+  namespace: messaging
+spec:
+  # minAvailable as a percentage rather than a count, so it stays correct as
+  # the HPA scales. This is what stops a node-pool upgrade draining every
+  # replica at once.
+  minAvailable: 75%
+  selector:
+    matchLabels:
+      app: chat-service
+---
+# Managed Prometheus scrapes this. The metrics then appear in Cloud
+# Monitoring, which is what the alert policies query.
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: chat-service
+  namespace: messaging
+spec:
+  selector:
+    matchLabels:
+      app: chat-service
+  endpoints:
+    - port: admin
+      path: /metrics
+      interval: 30s

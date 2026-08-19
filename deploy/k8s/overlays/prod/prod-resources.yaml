@@ -1,0 +1,39 @@
+# Production sizing for the two services that carry the load.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chat-service
+  namespace: messaging
+spec:
+  replicas: 6
+  template:
+    spec:
+      containers:
+        - name: chat-service
+          env:
+            - name: GOMEMLIMIT
+              value: "1740MiB"
+          resources:
+            requests:
+              cpu: "1"
+              memory: 1Gi
+            limits:
+              memory: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: realtime-gateway
+  namespace: messaging
+spec:
+  replicas: 6
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: persister
+  namespace: messaging
+spec:
+  # Matched to the Kafka partition count in prod (64) divided by a factor
+  # that leaves room to scale: 8 pods each own 8 partitions.
+  replicas: 8

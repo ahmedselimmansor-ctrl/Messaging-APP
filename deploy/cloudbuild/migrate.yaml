@@ -1,0 +1,27 @@
+# Builds the migration image: psql plus the SQL files.
+#
+# It is a separate image from the services because it needs a shell and the
+# postgres client, neither of which belong in a distroless service image.
+
+substitutions:
+  _REGION: "europe-west1"
+  _REPOSITORY: "messaging-app"
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+timeout: 600s
+
+steps:
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - --file=build/Dockerfile.migrate
+      - --tag=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/migrate:${SHORT_SHA}
+      - --tag=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/migrate:latest
+      - .
+
+  - id: push
+    name: gcr.io/cloud-builders/docker
+    args: [push, --all-tags, "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/migrate"]

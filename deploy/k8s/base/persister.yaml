@@ -1,0 +1,157 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: persister
+  namespace: messaging
+  labels: { app: persister, tier: consumer }
+spec:
+  replicas: 4
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels: { app: persister }
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxSurge: 1, maxUnavailable: 1 }
+  template:
+    metadata:
+      labels: { app: persister, tier: consumer }
+      annotations:
+        proxy.istio.io/config: |
+          holdApplicationUntilProxyStarts: true
+    spec:
+      serviceAccountName: persister
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: { app: persister }
+      nodeSelector: { workload: stateless }
+      initContainers:
+        - name: cloudsql-proxy
+          image: gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.14.1
+          restartPolicy: Always
+          args: ["--structured-logs", "--auto-iam-authn", "--private-ip",
+                 "--health-check", "--http-address=0.0.0.0", "--http-port=9801",
+                 "--max-sigterm-delay=30s", "$(CLOUDSQL_CONNECTION_NAME)"]
+          env:
+            - name: CLOUDSQL_CONNECTION_NAME
+              valueFrom: { configMapKeyRef: { name: platform-config, key: CLOUDSQL_CONNECTION_NAME } }
+          ports: [{ containerPort: 5432, name: postgres }]
+          startupProbe:
+            httpGet: { path: /startup, port: 9801 }
+            periodSeconds: 1
+            failureThreshold: 60
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 256Mi }
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+      containers:
+        - name: persister
+          image: IMAGE_REPOSITORY/persister:latest
+          ports:
+            - { name: http, containerPort: 8080 }
+            - { name: admin, containerPort: 9090 }
+          envFrom:
+            - configMapRef: { name: platform-config }
+          env:
+            - { name: SERVICE_NAME, value: persister }
+            - name: HOSTNAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - { name: GOMEMLIMIT, value: "870MiB" }
+            # svc_persister is the only role permitted to write message
+            # history, so nothing else can forge a message that never
+            # passed through Kafka.
+            - { name: CASSANDRA_USERNAME, value: "svc_persister" }
+            - { name: CASSANDRA_PASSWORD_FILE, value: /var/secrets/cassandra-password }
+          startupProbe:
+            httpGet: { path: /readyz, port: admin }
+            periodSeconds: 2
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: { path: /readyz, port: admin }
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: { path: /healthz, port: admin }
+            periodSeconds: 15
+            failureThreshold: 5
+          lifecycle:
+            preStop: { exec: { command: ["/bin/sleep", "5"] } }
+          resources:
+            requests: { cpu: 500m, memory: 512Mi }
+            limits: { memory: 1Gi }
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+            - { name: secrets, mountPath: /var/secrets, readOnly: true }
+      volumes:
+        - name: tmp
+          emptyDir: { sizeLimit: 64Mi }
+        - name: secrets
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes: { secretProviderClass: persister-secrets }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: persister
+  namespace: messaging
+  labels: { app: persister }
+spec:
+  clusterIP: None
+  selector: { app: persister }
+  ports:
+    - { name: admin, port: 9090, targetPort: admin }
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: { name: persister, namespace: messaging }
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: persister }
+  minReplicas: 4
+  maxReplicas: 32
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: { type: Utilization, averageUtilization: 70 }
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: { name: persister, namespace: messaging }
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels: { app: persister }
+---
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata: { name: persister, namespace: messaging }
+spec:
+  selector:
+    matchLabels: { app: persister }
+  endpoints:
+    - { port: admin, path: /metrics, interval: 30s }

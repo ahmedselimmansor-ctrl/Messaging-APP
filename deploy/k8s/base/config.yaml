@@ -1,0 +1,267 @@
+# Shared configuration for every service.
+#
+# The values here are placeholders that the kustomize overlays replace per
+# environment. `terraform output -json workload_env` produces exactly this
+# map; scripts/render-env.sh turns it into an overlay patch, so the
+# infrastructure and the workload configuration cannot drift.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: platform-config
+  namespace: messaging
+data:
+  ENV: "dev"
+  GCP_PROJECT_ID: "PROJECT_ID"
+  GCP_REGION: "europe-west1"
+
+  LOG_LEVEL: "info"
+  # 5% head sampling. Full sampling on a chat platform generates more trace
+  # data than message data; 5% is enough to characterise latency and cheap
+  # enough to leave on permanently.
+  TRACE_SAMPLE_RATIO: "0.05"
+  # The OpenTelemetry Collector DaemonSet, reached on the node's own address
+  # so a trace export never crosses a node boundary.
+  OTLP_ENDPOINT: "$(NODE_IP):4317"
+
+  HTTP_ADDR: ":8080"
+  ADMIN_ADDR: ":9090"
+  # Must stay below terminationGracePeriodSeconds in every Deployment.
+  SHUTDOWN_GRACE: "25s"
+
+  # --- Kafka --------------------------------------------------------------
+  KAFKA_BROKERS: "bootstrap.messaging-dev-kafka.europe-west1.managedkafka.PROJECT_ID.cloud.goog:9092"
+  KAFKA_TLS: "true"
+  KAFKA_OAUTH: "true"
+
+  # --- Redis --------------------------------------------------------------
+  REDIS_ADDRS: "REDIS_DISCOVERY_ENDPOINT"
+  REDIS_CLUSTER: "true"
+  REDIS_TLS: "true"
+  REDIS_POOL_SIZE: "100"
+
+  # --- Postgres -----------------------------------------------------------
+  # Through the Cloud SQL Auth Proxy sidecar on localhost. IAM authentication
+  # means there is no password in this string.
+  CLOUDSQL_CONNECTION_NAME: "PROJECT_ID:europe-west1:messaging-dev-pg"
+  POSTGRES_DSN: "postgres://127.0.0.1:5432/messaging?sslmode=disable"
+  POSTGRES_MAX_CONNS: "20"
+
+  # --- Cassandra ----------------------------------------------------------
+  # The headless Service resolves to every ready Cassandra pod, so the driver
+  # discovers the full ring from any one of them.
+  CASSANDRA_HOSTS: "cassandra-0.cassandra.data.svc.cluster.local:9042,cassandra-1.cassandra.data.svc.cluster.local:9042,cassandra-2.cassandra.data.svc.cluster.local:9042"
+  CASSANDRA_KEYSPACE: "messaging"
+  CASSANDRA_LOCAL_DC: "europe-west1"
+  CASSANDRA_CONSISTENCY: "LOCAL_QUORUM"
+
+  # --- Elasticsearch ------------------------------------------------------
+  ELASTICSEARCH_ADDRS: "http://elasticsearch.data.svc.cluster.local:9200"
+  ELASTICSEARCH_INDEX: "messages"
+
+  # --- Service discovery --------------------------------------------------
+  AUTH_SERVICE_URL: "http://auth-service.messaging.svc.cluster.local"
+  CHAT_SERVICE_URL: "http://chat-service.messaging.svc.cluster.local"
+  PRESENCE_SERVICE_URL: "http://presence-service.messaging.svc.cluster.local"
+  MEDIA_SERVICE_URL: "http://media-service.messaging.svc.cluster.local"
+  JWKS_URL: "http://auth-service.messaging.svc.cluster.local/.well-known/jwks.json"
+
+  # --- Storage ------------------------------------------------------------
+  MEDIA_BUCKET: "messaging-dev-media"
+  PUBLIC_BUCKET: "messaging-dev-public"
+  # Retention-locked in prod. The auditor refuses to start without it,
+  # because an audit consumer with no archive is indistinguishable from a
+  # working one in every dashboard while providing none of the assurance.
+  AUDIT_ARCHIVE_BUCKET: "messaging-dev-audit-archive"
+  CDN_HOST: "cdn.dev.example.com"
+  MAX_UPLOAD_BYTES: "2147483648"
+
+  # --- Realtime -----------------------------------------------------------
+  MTPROTO_TCP_ADDR: ":4443"
+  MTPROTO_UDP_ADDR: ":4443"
+  MTPROTO_WS_ADDR: ":8080"
+  MTPROTO_WS_PATH: "/mtproto"
+  # Client pings every 60s; the connection is reclaimed after 150s of silence,
+  # which tolerates two missed pings — long enough to survive a tunnel, short
+  # enough that dead sockets do not accumulate.
+  PING_INTERVAL: "60s"
+  IDLE_TIMEOUT: "150s"
+  HANDSHAKE_TIMEOUT: "30s"
+  SESSION_TTL: "720h"
+  MAX_CONNECTIONS_PER_POD: "40000"
+  UPDATE_QUEUE_SIZE: "256"
+
+  # --- Auth ---------------------------------------------------------------
+  JWT_ISSUER: "messaging"
+  JWT_AUDIENCE: "messaging-api"
+  JWT_ACCESS_TTL: "15m"
+  JWT_REFRESH_TTL: "1440h"
+  OTP_CODE_LENGTH: "5"
+  OTP_TTL: "5m"
+  OTP_MAX_ATTEMPTS: "5"
+  SMS_PROVIDER: "webhook"
+
+  # --- Chat ---------------------------------------------------------------
+  MEMBERS_CACHE_TTL: "5m"
+  MAX_MESSAGE_RUNES: "4096"
+  MAX_GROUP_MEMBERS: "200000"
+
+  # --- Push ---------------------------------------------------------------
+  # Off by default: the server composes this string, so a preview would put
+  # message content on a lock screen and, for secret chats, would be
+  # impossible anyway.
+  PUSH_SHOW_PREVIEW: "false"
+  FCM_DRY_RUN: "false"
+---
+# Secret Manager CSI driver configuration.
+#
+# One SecretProviderClass per workload, not one for the namespace. A shared
+# class would mount every credential into every pod, which makes the
+# per-service Cassandra roles in db/cassandra/roles.cql decorative: the media
+# service would hold the persister's password whether or not it ever used it.
+#
+# Secrets are projected as files only. There are deliberately no secretObjects
+# here for the credentials — syncing to a Kubernetes Secret makes the value
+# readable by anything in the namespace with `get secrets`, which is exactly
+# the namespace-wide exposure this split exists to remove. Services read the
+# projected file through the KEY_FILE convention (see config.Secret), so the
+# value is read once at startup and never enters the process environment.
+#
+# The real boundary is IAM: each workload's Google service account is granted
+# secretAccessor on its own secrets and nothing else (deploy/terraform/main.tf).
+# The CSI mount cannot fetch what the identity cannot read, so a manifest edit
+# alone does not widen access.
+#
+# PROJECT_ID and ENV are substituted per overlay.
+
+apiVersion: secrets-store.csi.x-k8s.io/v1
+kind: SecretProviderClass
+metadata:
+  name: auth-secrets
+  namespace: messaging
+spec:
+  provider: gke
+  parameters:
+    secrets: |
+      - resourceName: "projects/PROJECT_ID/secrets/messaging-ENV-jwt-signing-key/versions/latest"
+        path: "jwt-signing-key.pem"
+      - resourceName: "projects/PROJECT_ID/secrets/messaging-ENV-sms-webhook-auth/versions/latest"
+        path: "sms-webhook-auth"
+---
+# The gateway holds the MTProto RSA private key. Nothing else needs it, and
+# nothing else should be able to impersonate the server's handshake.
+apiVersion: secrets-store.csi.x-k8s.io/v1
+kind: SecretProviderClass
+metadata:
+  name: gateway-secrets
+  namespace: messaging
+spec:
+  provider: gke
+  parameters:
+    secrets: |
+      - resourceName: "projects/PROJECT_ID/secrets/messaging-ENV-mtproto-server-key/versions/latest"
+        path: "mtproto-server-key.pem"
+---
+# svc_chat: reads history, writes edits and soft deletes. It cannot insert a
+# new message — that is the persister's grant, so a compromised chat service
+# cannot forge history that skipped the Kafka durability boundary.
+apiVersion: secrets-store.csi.x-k8s.io/v1
+kind: SecretProviderClass
+metadata:
+  name: chat-secrets
+  namespace: messaging
+spec:
+  provider: gke
+  parameters:
+    secrets: |
+      - resourceName: "projects/PROJECT_ID/secrets/messaging-ENV-cassandra-chat-credentials/versions/latest"
+        path: "cassandra-password"
+---
+# svc_persister: the only role that may write message history.
+apiVersion: secrets-store.csi.x-k8s.io/v1
+kind: SecretProviderClass
+metadata:
+  name: persister-secrets
+  namespace: messaging
+spec:
+  provider: gke
+  parameters:
+    secrets: |
+      - resourceName: "projects/PROJECT_ID/secrets/messaging-ENV-cassandra-persister-credentials/versions/latest"
+        path: "cassandra-password"
+---
+# svc_media: SELECT on media_acl and nothing else. This is the grant that
+# matters most — the media service is internet-facing and handles
+# attacker-supplied object paths, and it must not be able to read a single
+# message body.
+apiVersion: secrets-store.csi.x-k8s.io/v1
+kind: SecretProviderClass
+metadata:
+  name: media-secrets
+  namespace: messaging
+spec:
+  provider: gke
+  parameters:
+    secrets: |
+      - resourceName: "projects/PROJECT_ID/secrets/messaging-ENV-cassandra-media-credentials/versions/latest"
+        path: "cassandra-password"
+---
+# Elasticsearch, for the indexer (writes) and the search service (reads).
+# Elasticsearch's own role mapping is what separates those two; this is one
+# credential because the cluster is external to the mesh and its roles are
+# configured there.
+apiVersion: secrets-store.csi.x-k8s.io/v1
+kind: SecretProviderClass
+metadata:
+  name: search-secrets
+  namespace: messaging
+spec:
+  provider: gke
+  parameters:
+    secrets: |
+      - resourceName: "projects/PROJECT_ID/secrets/messaging-ENV-elasticsearch-credentials/versions/latest"
+        path: "elasticsearch-password"
+---
+# The call service mints TURN credentials by HMAC-ing an expiry with the shared
+# secret; coturn verifies them with the same secret. Both need it, and it is
+# the one value here that is genuinely shared rather than per-service.
+apiVersion: secrets-store.csi.x-k8s.io/v1
+kind: SecretProviderClass
+metadata:
+  name: call-secrets
+  namespace: messaging
+spec:
+  provider: gke
+  parameters:
+    secrets: |
+      - resourceName: "projects/PROJECT_ID/secrets/messaging-ENV-turn-credentials/versions/latest"
+        path: "turn-secret"
+---
+# coturn is the one place a synced Kubernetes Secret is unavoidable.
+#
+# Everything else here reads its credential from the projected file, keeping
+# the value out of the process environment and out of etcd. coturn is a
+# third-party image that takes its static-auth-secret from an environment
+# variable, and there is no file-based equivalent, so secretObjects syncs it.
+#
+# The exposure is bounded and worth naming: this makes the TURN secret
+# readable by anything in the namespace that can `get secrets`. That secret
+# grants relay bandwidth, not access to messages — TURN relays already-
+# encrypted media and never holds a key. Namespace RBAC is what limits who can
+# read it.
+apiVersion: secrets-store.csi.x-k8s.io/v1
+kind: SecretProviderClass
+metadata:
+  name: coturn-secrets
+  namespace: messaging
+spec:
+  provider: gke
+  parameters:
+    secrets: |
+      - resourceName: "projects/PROJECT_ID/secrets/messaging-ENV-turn-credentials/versions/latest"
+        path: "turn-secret"
+  secretObjects:
+    - secretName: turn-secret
+      type: Opaque
+      data:
+        - objectName: turn-secret
+          key: secret
