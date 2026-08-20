@@ -39,7 +39,7 @@ flowchart TB
             media["media-service"]
             notif["notification-service"]
             search["search-service"]
-            call["call-service"]
+            callsvc["call-service"]
             admin["admin-service<br/><i>no public route</i>"]
         end
 
@@ -78,7 +78,7 @@ flowchart TB
     chat -.reads history.-> cass
     auth --> sql & redis
     media --> gcs & cass
-    call --> turn
+    callsvc --> turn
 
     kafka --> persister & pusher & indexer & mediaproc & auditor
     persister --> cass & sql
@@ -95,7 +95,7 @@ flowchart TB
     classDef svc fill:#1e3d2f,stroke:#4ade80,color:#fff
     classDef edgec fill:#3d2f1e,stroke:#fbbf24,color:#fff
     class cass,sql,redis,es store
-    class gw,auth,chat,presence,media,notif,search,call,admin svc
+    class gw,auth,chat,presence,media,notif,search,callsvc,admin svc
     class dns,armor,https,nlb,cdn edgec
 ```
 
