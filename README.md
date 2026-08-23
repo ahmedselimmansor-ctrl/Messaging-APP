@@ -335,7 +335,7 @@ flowchart LR
 ```
 
 Reads walk buckets downwards, recomputing the cursor as
-`(bucket + 1) × BucketSize` — arithmetic that has to land exactly on the next
+`(bucket + 1) × BucketSize` , arithmetic that has to land exactly on the next
 boundary, since one too high re-reads a message and one too low skips one
 silently. That walk is [tested by replaying it](pkg/cassandrax/cassandra_test.go).
 
