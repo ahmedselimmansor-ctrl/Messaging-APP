@@ -5,9 +5,9 @@ The visual fingerprint needs exactly 2048 words so each carries 11 bits.
 
 The list is generated rather than curated, for three reasons:
 
-  * Every implementation — Go, TypeScript, Kotlin — can regenerate the
+  * Every implementation — Go and TypeScript — can regenerate the
     identical list from this script, so no data file has to be vendored and
-    kept in step across three languages.
+    kept in step across two languages.
   * Every entry is a pronounceable nonsense syllable, so nothing in the list
     is offensive, ambiguous, or unfortunate in some language we did not think
     about. A user reading a fingerprint aloud to a colleague should not have

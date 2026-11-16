@@ -7,9 +7,8 @@
 //     the framing, the obfuscation, the envelope and the dispatch all compose
 //     — which no amount of unit testing each layer separately does.
 //  2. It is what the load generator drives.
-//  3. It is the reference the Kotlin and TypeScript clients are written
-//     against: when a mobile client misbehaves, this is the thing to compare
-//     it to.
+//  3. It is the reference the TypeScript client is written against: when a
+//     client misbehaves, this is the thing to compare it to.
 package mtclient
 
 import (

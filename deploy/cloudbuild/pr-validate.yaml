@@ -104,20 +104,6 @@ steps:
         npm run typecheck
         npm test
 
-  # The Kotlin MTProto module is pure JVM, so it tests without an emulator.
-  # It asserts the same pinned vectors as the Go and TypeScript suites: three
-  # independent implementations of one specification will drift apart
-  # eventually, and this is what turns that into a build failure rather than
-  # an Android client that silently cannot decrypt anything.
-  - id: android
-    name: gradle:8.11-jdk21
-    entrypoint: bash
-    args:
-      - -ec
-      - |
-        cd android
-        gradle --no-daemon :mtproto:test
-
   # Scan the manifests for insecure settings. This is where a forgotten
   # privileged: true or a missing resource limit gets caught.
   - id: scan-manifests

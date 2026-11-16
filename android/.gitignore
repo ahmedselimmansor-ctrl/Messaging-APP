@@ -1,5 +1,0 @@
-build/
-.libs/
-.gradle/
-local.properties
-*.iml

@@ -90,18 +90,12 @@ vulncheck: ## Report reachable vulnerabilities
 web-test: ## Typecheck and test the web client's MTProto implementation
 	cd web && npm run typecheck && npm test
 
-.PHONY: android-test
-android-test: ## Compile and test the Kotlin MTProto module (needs kotlinc + a JDK)
-	./scripts/android-test.sh
-
 .PHONY: cross-check
-cross-check: ## Verify all three protocol implementations agree
+cross-check: ## Verify both protocol implementations agree
 	@echo "=== Go ==="
 	$(GO) test -count=1 -run 'CrossImplementation|KnownAnswer' ./pkg/mtproto/
 	@echo "=== TypeScript ==="
 	cd web && npm test
-	@echo "=== Kotlin ==="
-	./scripts/android-test.sh
 
 .PHONY: check
 check: vet test-race ## Everything CI runs on a pull request

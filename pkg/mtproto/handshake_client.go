@@ -17,7 +17,7 @@ import (
 // It lives in the server repository on purpose: it is what the load generator
 // and the end-to-end tests drive, and keeping both halves next to each other
 // is what makes it possible to test the handshake for real rather than mock
-// it. The Kotlin and TypeScript clients implement the same six steps.
+// it. The TypeScript client implements the same six steps.
 type ClientHandshake struct {
 	serverPub *rsa.PublicKey
 	fp        uint64

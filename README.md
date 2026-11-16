@@ -14,7 +14,6 @@ Arabic overview: [README.ar.md](README.ar.md).
 flowchart TB
     subgraph clients["Clients"]
         web["Web<br/><i>TypeScript MTProto</i>"]
-        android["Android<br/><i>Kotlin MTProto</i>"]
         cli["loadgen<br/><i>Go MTProto</i>"]
     end
 
@@ -66,7 +65,7 @@ flowchart TB
         sm["Secret Manager<br/>+ Cloud KMS"]
     end
 
-    web & android --> dns
+    web --> dns
     cli --> dns
     dns --> https & nlb
     https --> armor --> auth & chat & media & search
@@ -393,7 +392,6 @@ services/
   admin-service/        moderation; not reachable from the internet
   consumers/            persister, pusher, indexer, mediaproc, auditor
 web/                    Next.js client with its own MTProto implementation
-android/                Kotlin MTProto module, pinned to the same vectors
 db/                     Cassandra CQL, per-service roles, Postgres migrations
 deploy/
   terraform/            the full GCP footprint, three environments
@@ -451,8 +449,7 @@ make check
 |---|---|
 | `go test -race ./...` | 26 packages |
 | `cd web && npm test` | the browser MTProto implementation |
-| `./scripts/android-test.sh` | the Kotlin module |
-| `make cross-check` | all three implementations against identical vectors |
+| `make cross-check` | both implementations against identical vectors |
 | `make k8s-validate` | kubeconform, three overlays |
 | `terraform validate` | the whole GCP footprint |
 
@@ -513,7 +510,7 @@ Deliberate deviations, each documented where it lives:
 - **TL serialisation** covers the subset these services exchange, not the full
   published schema.
 
-Three independent implementations — Go, TypeScript and Kotlin — are pinned to
+Two independent implementations — Go and TypeScript — are pinned to
 identical test vectors, so a divergence fails the build rather than silently
 breaking one client.
 
@@ -566,8 +563,8 @@ with a manual approval gate before prod.
 
 Stated up front rather than discovered later:
 
-- **An iOS client.** There are three independent MTProto implementations — Go,
-  TypeScript and Kotlin, all pinned to the same vectors — but no Swift one.
+- **An iOS client.** There are two independent MTProto implementations — Go
+  and TypeScript, both pinned to the same vectors — but no Swift one.
 - **Automated moderation.** Users can report, staff can review and ban, and
   every step is audited, but there is no content classification or reputation
   scoring. Moderation is human by design.
